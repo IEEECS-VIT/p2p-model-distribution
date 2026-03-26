@@ -1,0 +1,11 @@
+#!/bin/sh
+
+branch="$(git rev-parse --abbrev-ref HEAD)"
+
+if [ "$branch" = "main" ]; then
+  echo "---Direct pushes to 'main' are not allowed.---"
+  echo "Create a feature branch and open a Pull Request."
+  exit 1
+fi
+
+exit 0
