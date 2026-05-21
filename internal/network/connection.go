@@ -24,6 +24,9 @@ type Connection struct {
 	peerID string
 
 	connectedAt time.Time
+
+	// Incoming channel delivers successfully framed incoming messages to the application.
+	Incoming chan []byte
 }
 
 // NewConnection wraps an existing net.Conn.
@@ -32,7 +35,36 @@ func NewConnection(conn net.Conn, peerID string) *Connection {
 		conn:        conn,
 		peerID:      peerID,
 		connectedAt: time.Now(),
+		Incoming:    make(chan []byte, 100), // buffered to prevent blocking the read loop immediately
 	}
+}
+
+// Start spins up the connection's read loop to process incoming frames.
+func (c *Connection) Start() {
+	go c.readLoop()
+}
+
+// readLoop continuously reads framed messages from the socket.
+func (c *Connection) readLoop() {
+	defer func() {
+		c.Close()
+		close(c.Incoming)
+	}()
+
+	for {
+		data, err := ReadFrame(c.conn)
+		if err != nil {
+			return
+		}
+		c.Incoming <- data
+	}
+}
+
+// WriteMessage writes a framed message to the underlying connection in a thread-safe manner.
+func (c *Connection) WriteMessage(data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return WriteFrame(c.conn, data)
 }
 
 // Close gracefully terminates the TCP connection.
@@ -49,3 +81,4 @@ func (c *Connection) RemoteAddr() net.Addr {
 func (c *Connection) PeerID() string {
 	return c.peerID
 }
+
