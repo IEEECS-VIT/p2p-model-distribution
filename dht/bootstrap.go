@@ -2,6 +2,6 @@ package dht
 
 //bootstrap helpers for initial peer discovery.
 
-func SeedNodes() []string {
-	return []string{}
+func SeedNodes() []Node {
+	return nil
 }
