@@ -21,3 +21,30 @@ func (b *Bucket) Add(n Node) {
 
 	b.Peers = append(b.Peers, n)
 }
+
+func (b *Bucket) Has(id string) bool {
+	for _, peer := range b.Peers {
+		if peer.ID == id {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (b *Bucket) Remove(id string) {
+	filtered := b.Peers[:0]
+	for _, peer := range b.Peers {
+		if peer.ID != id {
+			filtered = append(filtered, peer)
+		}
+	}
+
+	b.Peers = filtered
+}
+
+func (b *Bucket) List() []Node {
+	peers := make([]Node, len(b.Peers))
+	copy(peers, b.Peers)
+	return peers
+}
