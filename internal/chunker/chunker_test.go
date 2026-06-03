@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/chunker"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/filemeta"
 )
 
 func TestRoundTrip(t *testing.T) {
@@ -22,11 +23,14 @@ func TestRoundTrip(t *testing.T) {
 	}
 
 	chunkDir := t.TempDir()
+	manifestDir := t.TempDir()
 	const chunkSize = 256 * 1024
-	chunks, modelHash, err := chunker.SplitFile(srcPath, chunkDir, chunkSize)
+	meta, _, _, err := filemeta.BuildManifest(srcPath, "file-123", chunkSize, chunkDir, manifestDir)
 	if err != nil {
-		t.Fatalf("SplitFile: %v", err)
+		t.Fatalf("BuildManifest: %v", err)
 	}
+	chunks := meta.Chunks
+	modelHash := meta.ModelHash
 
 	expectedChunks := (fileSize + chunkSize - 1) / chunkSize
 	if len(chunks) != expectedChunks {
@@ -78,10 +82,11 @@ func TestSingleChunk(t *testing.T) {
 	srcPath := t.TempDir() + "/small.bin"
 	os.WriteFile(srcPath, data, 0644)
 
-	chunks, _, err := chunker.SplitFile(srcPath, t.TempDir(), 256*1024)
+	meta, _, _, err := filemeta.BuildManifest(srcPath, "file-123", 256*1024, t.TempDir(), t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	chunks := meta.Chunks
 	if len(chunks) != 1 {
 		t.Errorf("expected 1 chunk, got %d", len(chunks))
 	}
