@@ -1,4 +1,4 @@
-package chunker
+package filemeta
 
 import (
 	"crypto/sha256"

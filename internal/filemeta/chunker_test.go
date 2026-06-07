@@ -1,4 +1,4 @@
-package chunker_test
+package filemeta_test
 
 import (
 	"bytes"
@@ -6,7 +6,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/IEEECS-VIT/p2p-model-distribution/internal/chunker"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/filemeta"
 )
 
@@ -43,7 +42,7 @@ func TestRoundTrip(t *testing.T) {
 			t.Errorf("read chunk %d: %v", c.Index, err)
 			continue
 		}
-		if err := chunker.VerifyChunk(data, c.Hash); err != nil {
+		if err := filemeta.VerifyChunk(data, c.Hash); err != nil {
 			t.Errorf("chunk %d verify: %v", c.Index, err)
 		}
 		if c.Index < len(chunks)-1 && c.Size != chunkSize {
@@ -60,7 +59,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 
 	outPath := t.TempDir() + "/reassembled.bin"
-	if err := chunker.AssembleChunks(chunkDir, outPath, chunks); err != nil {
+	if err := filemeta.AssembleChunks(chunkDir, outPath, chunks); err != nil {
 		t.Fatalf("AssembleChunks: %v", err)
 	}
 
@@ -72,7 +71,7 @@ func TestRoundTrip(t *testing.T) {
 		t.Error("reassembled file differs from original")
 	}
 
-	if err := chunker.VerifyFile(outPath, modelHash); err != nil {
+	if err := filemeta.VerifyFile(outPath, modelHash); err != nil {
 		t.Errorf("VerifyFile: %v", err)
 	}
 }
@@ -97,13 +96,13 @@ func TestSingleChunk(t *testing.T) {
 
 func TestVerifyChunkRejectsCorruption(t *testing.T) {
 	data := []byte("legitimate chunk data")
-	hash := chunker.HashBytes(data)
+	hash := filemeta.HashBytes(data)
 
 	corrupted := make([]byte, len(data))
 	copy(corrupted, data)
 	corrupted[5] ^= 0xFF
 
-	if err := chunker.VerifyChunk(corrupted, hash); err == nil {
+	if err := filemeta.VerifyChunk(corrupted, hash); err == nil {
 		t.Error("expected error for corrupted chunk, got nil")
 	}
 }

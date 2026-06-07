@@ -1,15 +1,13 @@
-package chunker
+package filemeta
 
 import (
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-
-	"github.com/IEEECS-VIT/p2p-model-distribution/internal/filemeta"
 )
 
-func AssembleChunks(chunkDir, outputPath string, chunks []filemeta.ChunkMeta) error {
+func AssembleChunks(chunkDir, outputPath string, chunks []ChunkMeta) error {
 	out, err := os.Create(outputPath)
 	if err != nil {
 		return fmt.Errorf("create output: %w", err)
