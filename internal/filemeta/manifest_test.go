@@ -1,31 +1,24 @@
 package filemeta
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
-	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 )
 
 func TestBuildManifestPopulatesDerivedFields(t *testing.T) {
-	srcPath := filepath.Join(t.TempDir(), "model.bin")
 	srcData := []byte("012345678901234567890123456789")
-	if err := os.WriteFile(srcPath, srcData, 0644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	reader := bytes.NewReader(srcData)
 
-	chunkDir := t.TempDir()
-	manifestDir := t.TempDir()
-
-	meta, cid, outPath, err := BuildManifest(
-		srcPath,
+	meta, cid, err := BuildManifest(
+		reader,
 		"file-123",
+		"model.bin",
+		int64(len(srcData)),
 		10,
-		chunkDir,
-		manifestDir,
 	)
 	if err != nil {
 		t.Fatalf("BuildManifest: %v", err)
@@ -67,20 +60,6 @@ func TestBuildManifestPopulatesDerivedFields(t *testing.T) {
 	}
 	if cid != expectedCID {
 		t.Fatalf("cid = %q, want %q", cid, expectedCID)
-	}
-
-	expectedPath := filepath.Join(manifestDir, cid+".json")
-	if outPath != expectedPath {
-		t.Fatalf("outPath = %q, want %q", outPath, expectedPath)
-	}
-	if _, err := os.Stat(outPath); err != nil {
-		t.Fatalf("expected BuildManifest to write file, stat err = %v", err)
-	}
-	for i := range meta.Chunks {
-		chunkPath := filepath.Join(chunkDir, fmt.Sprintf("%d.chunk", i))
-		if _, err := os.Stat(chunkPath); err != nil {
-			t.Fatalf("expected chunk file %d.chunk, stat err = %v", i, err)
-		}
 	}
 }
 
@@ -141,5 +120,49 @@ func TestSaveLoadManifestRoundTrip(t *testing.T) {
 
 	if !reflect.DeepEqual(loaded, meta) {
 		t.Fatalf("loaded manifest mismatch:\n got: %#v\nwant: %#v", loaded, meta)
+	}
+}
+
+func TestGenerateManifestCIDIgnoresMetadata(t *testing.T) {
+	meta1 := FileMeta{
+		FileID:    "file-123",
+		FileName:  "model.bin",
+		FileSize:  30,
+		ModelHash: "sha256:model",
+		ChunkSize: 1024,
+		NumChunks: 1,
+		Version:   manifestVersion,
+		CreatedAt: 1234567890,
+		Chunks: []ChunkMeta{
+			{Index: 0, CID: "sha256:aaa", Hash: "sha256:aaa", Size: 30},
+		},
+	}
+
+	meta2 := FileMeta{
+		FileID:    "file-999-different",
+		FileName:  "other-name.bin",
+		FileSize:  30,
+		ModelHash: "sha256:model",
+		ChunkSize: 1024,
+		NumChunks: 1,
+		Version:   manifestVersion,
+		CreatedAt: 9876543210, // different timestamp
+		Chunks: []ChunkMeta{
+			{Index: 0, CID: "sha256:aaa", Hash: "sha256:aaa", Size: 30},
+		},
+	}
+
+	cid1, err := GenerateManifestCID(meta1)
+	if err != nil {
+		t.Fatalf("GenerateManifestCID meta1: %v", err)
+	}
+
+	cid2, err := GenerateManifestCID(meta2)
+	if err != nil {
+		t.Fatalf("GenerateManifestCID meta2: %v", err)
+	}
+
+	if cid1 != cid2 {
+		t.Fatalf("Expected CIDs to be identical regardless of FileID, FileName, or CreatedAt; got %q and %q", cid1, cid2)
 	}
 }

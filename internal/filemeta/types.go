@@ -1,5 +1,8 @@
 package filemeta
 
+// DefaultChunkSize is the default size of each chunk (1MB).
+const DefaultChunkSize = 1024 * 1024
+
 type ChunkMeta struct {
 	Index int    `json:"index"`
 	CID   string `json:"cid"`
