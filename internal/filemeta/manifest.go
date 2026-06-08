@@ -7,42 +7,24 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 )
 
 const manifestVersion = "v1"
 
 func BuildManifest(
-	srcPath string,
+	src io.Reader,
 	fileID string,
+	fileName string,
+	fileSize int64,
 	chunkSize int,
-	chunkDir string,
-	manifestDir string,
-) (FileMeta, string, string, error) {
+) (FileMeta, string, error) {
 	if chunkSize <= 0 {
-		return FileMeta{}, "", "", fmt.Errorf("invalid chunk size: %d", chunkSize)
-	}
-
-	f, err := os.Open(srcPath)
-	if err != nil {
-		return FileMeta{}, "", "", fmt.Errorf("open source: %w", err)
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return FileMeta{}, "", "", fmt.Errorf("stat source: %w", err)
-	}
-
-	if chunkDir != "" {
-		if err := os.MkdirAll(chunkDir, 0755); err != nil {
-			return FileMeta{}, "", "", fmt.Errorf("create chunk dir: %w", err)
-		}
+		chunkSize = DefaultChunkSize
 	}
 
 	fileHasher := sha256.New()
-	reader := io.TeeReader(f, fileHasher)
+	reader := io.TeeReader(src, fileHasher)
 
 	var chunks []ChunkMeta
 	buf := make([]byte, chunkSize)
@@ -54,17 +36,12 @@ func BuildManifest(
 			break
 		}
 		if readErr != nil && readErr != io.ErrUnexpectedEOF {
-			return FileMeta{}, "", "", fmt.Errorf("read chunk %d: %w", index, readErr)
+			return FileMeta{}, "", fmt.Errorf("read chunk %d: %w", index, readErr)
 		}
 
 		data := buf[:n]
 		chunkDigest := sha256.Sum256(data)
 		chunkHash := "sha256:" + hex.EncodeToString(chunkDigest[:])
-
-		chunkPath := filepath.Join(chunkDir, fmt.Sprintf("%d.chunk", index))
-		if err := os.WriteFile(chunkPath, data, 0644); err != nil {
-			return FileMeta{}, "", "", fmt.Errorf("write chunk %d: %w", index, err)
-		}
 
 		chunks = append(chunks, ChunkMeta{
 			Index: index,
@@ -81,8 +58,8 @@ func BuildManifest(
 
 	meta := FileMeta{
 		FileID:    fileID,
-		FileName:  filepath.Base(srcPath),
-		FileSize:  info.Size(),
+		FileName:  fileName,
+		FileSize:  fileSize,
 		ModelHash: "sha256:" + hex.EncodeToString(fileHasher.Sum(nil)),
 		ChunkSize: chunkSize,
 		NumChunks: len(chunks),
@@ -93,21 +70,10 @@ func BuildManifest(
 
 	cid, err := GenerateManifestCID(meta)
 	if err != nil {
-		return FileMeta{}, "", "", err
+		return FileMeta{}, "", err
 	}
 
-	if manifestDir != "" {
-		if err := os.MkdirAll(manifestDir, 0755); err != nil {
-			return FileMeta{}, "", "", fmt.Errorf("create manifest dir: %w", err)
-		}
-	}
-
-	outPath := filepath.Join(manifestDir, cid+".json")
-	if err := SaveManifest(meta, outPath); err != nil {
-		return FileMeta{}, "", "", fmt.Errorf("save manifest: %w", err)
-	}
-
-	return meta, cid, outPath, nil
+	return meta, cid, nil
 }
 
 func SaveManifest(meta FileMeta, path string) error {
@@ -133,7 +99,28 @@ func LoadManifest(path string) (FileMeta, error) {
 }
 
 func GenerateManifestCID(meta FileMeta) (string, error) {
-	data, err := json.Marshal(meta)
+	// Use only content-identifying fields to compute the CID.
+	// This ensures that the CID is identical for the same content, even if CreatedAt,
+	// FileName, or FileID differ.
+	type StableMeta struct {
+		FileSize  int64       `json:"file_size"`
+		ModelHash string      `json:"model_hash"`
+		ChunkSize int         `json:"chunk_size"`
+		NumChunks int         `json:"num_chunks"`
+		Version   string      `json:"version"`
+		Chunks    []ChunkMeta `json:"chunks"`
+	}
+
+	stable := StableMeta{
+		FileSize:  meta.FileSize,
+		ModelHash: meta.ModelHash,
+		ChunkSize: meta.ChunkSize,
+		Version:   meta.Version,
+		NumChunks: meta.NumChunks,
+		Chunks:    meta.Chunks,
+	}
+
+	data, err := json.Marshal(stable)
 	if err != nil {
 		return "", err
 	}
