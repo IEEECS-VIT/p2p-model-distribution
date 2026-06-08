@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"sync"
 )
 
 func VerifyChunk(data []byte, expectedHash string) error {
@@ -33,13 +36,57 @@ func VerifyFile(filePath, modelHash string) error {
 
 // VerifyAllChunks verifies every chunk file in chunkDir against the manifest.
 // Returns a list of indices that failed — empty slice means all OK.
+// This function runs verification concurrently using a worker pool.
 func VerifyAllChunks(chunkDir string, chunks []ChunkMeta) []int {
-	var failed []int
-	for _, c := range chunks {
-		data, err := os.ReadFile(filepath.Join(chunkDir, fmt.Sprintf("%d.chunk", c.Index)))
-		if err != nil || VerifyChunk(data, c.Hash) != nil {
-			failed = append(failed, c.Index)
-		}
+	if len(chunks) == 0 {
+		return nil
 	}
+
+	numWorkers := runtime.NumCPU()
+	if numWorkers > len(chunks) {
+		numWorkers = len(chunks)
+	}
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	type task struct {
+		index int
+		hash  string
+	}
+
+	tasks := make(chan task, len(chunks))
+	results := make(chan int, len(chunks))
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range tasks {
+				chunkPath := filepath.Join(chunkDir, fmt.Sprintf("%d.chunk", t.index))
+				data, err := os.ReadFile(chunkPath)
+				if err != nil || VerifyChunk(data, t.hash) != nil {
+					results <- t.index
+				}
+			}
+		}()
+	}
+
+	for _, c := range chunks {
+		tasks <- task{index: c.Index, hash: c.Hash}
+	}
+	close(tasks)
+
+	wg.Wait()
+	close(results)
+
+	var failed []int
+	for idx := range results {
+		failed = append(failed, idx)
+	}
+
+	// Keep results sorted deterministically
+	sort.Ints(failed)
 	return failed
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/filemeta"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
 )
 
 func TestRoundTrip(t *testing.T) {
@@ -21,15 +22,15 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	chunkDir := t.TempDir()
-	manifestDir := t.TempDir()
 	const chunkSize = 256 * 1024
-	meta, _, _, err := filemeta.BuildManifest(srcPath, "file-123", chunkSize, chunkDir, manifestDir)
+	store := storage.NewStore(t.TempDir())
+	meta, _, err := store.StoreModel(srcPath, "file-123", chunkSize)
 	if err != nil {
-		t.Fatalf("BuildManifest: %v", err)
+		t.Fatalf("StoreModel failed: %v", err)
 	}
 	chunks := meta.Chunks
 	modelHash := meta.ModelHash
+	chunkDir := store.Layout().ChunksDir("file-123")
 
 	expectedChunks := (fileSize + chunkSize - 1) / chunkSize
 	if len(chunks) != expectedChunks {
@@ -81,7 +82,8 @@ func TestSingleChunk(t *testing.T) {
 	srcPath := t.TempDir() + "/small.bin"
 	os.WriteFile(srcPath, data, 0644)
 
-	meta, _, _, err := filemeta.BuildManifest(srcPath, "file-123", 256*1024, t.TempDir(), t.TempDir())
+	store := storage.NewStore(t.TempDir())
+	meta, _, err := store.StoreModel(srcPath, "file-123", 256*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,5 +106,85 @@ func TestVerifyChunkRejectsCorruption(t *testing.T) {
 
 	if err := filemeta.VerifyChunk(corrupted, hash); err == nil {
 		t.Error("expected error for corrupted chunk, got nil")
+	}
+}
+
+func TestAssembleChunksHandlesOutofOrder(t *testing.T) {
+	chunkDir := t.TempDir()
+	outPath := t.TempDir() + "/ordered.bin"
+
+	// Write three chunks
+	c0 := []byte("Chunk0-")
+	c1 := []byte("Chunk1-")
+	c2 := []byte("Chunk2")
+
+	os.WriteFile(fmt.Sprintf("%s/0.chunk", chunkDir), c0, 0644)
+	os.WriteFile(fmt.Sprintf("%s/1.chunk", chunkDir), c1, 0644)
+	os.WriteFile(fmt.Sprintf("%s/2.chunk", chunkDir), c2, 0644)
+
+	// Provide chunks out of order
+	chunks := []filemeta.ChunkMeta{
+		{Index: 2, Size: len(c2)},
+		{Index: 0, Size: len(c0)},
+		{Index: 1, Size: len(c1)},
+	}
+
+	if err := filemeta.AssembleChunks(chunkDir, outPath, chunks); err != nil {
+		t.Fatalf("AssembleChunks failed: %v", err)
+	}
+
+	result, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := "Chunk0-Chunk1-Chunk2"
+	if string(result) != expected {
+		t.Errorf("Expected assembled file content %q, got %q", expected, string(result))
+	}
+}
+
+func TestAssembleChunksRejectsGaps(t *testing.T) {
+	chunkDir := t.TempDir()
+	outPath := t.TempDir() + "/broken.bin"
+
+	// Write chunks but skip index 1
+	os.WriteFile(fmt.Sprintf("%s/0.chunk", chunkDir), []byte("A"), 0644)
+	os.WriteFile(fmt.Sprintf("%s/2.chunk", chunkDir), []byte("C"), 0644)
+
+	chunks := []filemeta.ChunkMeta{
+		{Index: 0, Size: 1},
+		{Index: 2, Size: 1},
+	}
+
+	if err := filemeta.AssembleChunks(chunkDir, outPath, chunks); err == nil {
+		t.Error("Expected error due to missing chunk at index 1, got nil")
+	}
+}
+
+func TestVerifyAllChunksParallel(t *testing.T) {
+	chunkDir := t.TempDir()
+
+	c0 := []byte("data0")
+	c1 := []byte("data1-corrupted")
+	c2 := []byte("data2")
+
+	h0 := filemeta.HashBytes(c0)
+	h1 := filemeta.HashBytes([]byte("data1-expected")) // will mismatch
+	h2 := filemeta.HashBytes(c2)
+
+	os.WriteFile(fmt.Sprintf("%s/0.chunk", chunkDir), c0, 0644)
+	os.WriteFile(fmt.Sprintf("%s/1.chunk", chunkDir), c1, 0644)
+	os.WriteFile(fmt.Sprintf("%s/2.chunk", chunkDir), c2, 0644)
+
+	chunks := []filemeta.ChunkMeta{
+		{Index: 0, Hash: h0, Size: len(c0)},
+		{Index: 1, Hash: h1, Size: len(c1)},
+		{Index: 2, Hash: h2, Size: len(c2)},
+	}
+
+	failed := filemeta.VerifyAllChunks(chunkDir, chunks)
+	if len(failed) != 1 || failed[0] != 1 {
+		t.Errorf("Expected only chunk 1 to fail verification, got %v", failed)
 	}
 }
