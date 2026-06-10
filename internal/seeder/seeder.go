@@ -6,12 +6,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/filemeta"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
 )
 
 type Seeder struct {
+	mu          sync.RWMutex
 	manifestDir string
 	store       *storage.ChunkStore
 	manifests   map[string]filemeta.FileMeta
@@ -41,6 +43,8 @@ func New(manifestDir, chunkBaseDir string) (*Seeder, error) {
 // RegisterManifest adds a freshly built manifest to the in-memory map
 // without needing a restart. Call this right after BuildManifest.
 func (s *Seeder) RegisterManifest(cid string, meta filemeta.FileMeta) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.manifests[cid] = meta
 }
 
@@ -72,7 +76,9 @@ func (s *Seeder) handleManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.mu.RLock()
 	_, ok := s.manifests[cid]
+	s.mu.RUnlock()
 	if !ok {
 		http.Error(w, "manifest not found", http.StatusNotFound)
 		return
@@ -112,7 +118,9 @@ func (s *Seeder) handleChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.mu.RLock()
 	meta, ok := s.manifests[cid]
+	s.mu.RUnlock()
 	if !ok {
 		http.Error(w, "manifest not found", http.StatusNotFound)
 		return
@@ -143,7 +151,10 @@ func (s *Seeder) handleChunk(w http.ResponseWriter, r *http.Request) {
 
 // GET /health
 func (s *Seeder) handleHealth(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, `{"status":"ok","manifests":%d}`, len(s.manifests))
+	s.mu.RLock()
+	count := len(s.manifests)
+	s.mu.RUnlock()
+	fmt.Fprintf(w, `{"status":"ok","manifests":%d}`, count)
 }
 
 // loadAllManifests reads every .json in manifestDir into memory.
