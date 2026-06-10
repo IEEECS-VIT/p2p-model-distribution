@@ -19,6 +19,17 @@ func BuildManifest(
 	fileSize int64,
 	chunkSize int,
 ) (FileMeta, string, error) {
+	return BuildManifestWithChunkWriter(src, fileID, fileName, fileSize, chunkSize, nil)
+}
+
+func BuildManifestWithChunkWriter(
+	src io.Reader,
+	fileID string,
+	fileName string,
+	fileSize int64,
+	chunkSize int,
+	writeChunk func(index int, data []byte) error,
+) (FileMeta, string, error) {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
@@ -39,7 +50,7 @@ func BuildManifest(
 			return FileMeta{}, "", fmt.Errorf("read chunk %d: %w", index, readErr)
 		}
 
-		data := buf[:n]
+		data := append([]byte(nil), buf[:n]...)
 		chunkDigest := sha256.Sum256(data)
 		chunkHash := "sha256:" + hex.EncodeToString(chunkDigest[:])
 
@@ -49,8 +60,14 @@ func BuildManifest(
 			Hash:  chunkHash,
 			Size:  n,
 		})
-		index++
 
+		if writeChunk != nil {
+			if err := writeChunk(index, data); err != nil {
+				return FileMeta{}, "", fmt.Errorf("write chunk %d: %w", index, err)
+			}
+		}
+
+		index++
 		if readErr == io.ErrUnexpectedEOF {
 			break
 		}
@@ -96,6 +113,13 @@ func LoadManifest(path string) (FileMeta, error) {
 	err = json.Unmarshal(data, &meta)
 
 	return meta, err
+}
+
+// LoadManifestBytes returns the raw JSON bytes of a manifest file.
+// Use this when you need to serve the manifest over HTTP without
+// round-tripping through unmarshal → marshal.
+func LoadManifestBytes(path string) ([]byte, error) {
+	return os.ReadFile(path)
 }
 
 func GenerateManifestCID(meta FileMeta) (string, error) {

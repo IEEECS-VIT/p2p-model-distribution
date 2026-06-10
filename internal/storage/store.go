@@ -16,11 +16,25 @@ type Store struct {
 	layout *Layout
 }
 
+// ChunkStore stores chunks in a CID-scoped layout.
+type ChunkStore struct {
+	BaseDir string
+}
+
 // NewStore creates a new Store instance with the given base directory.
 func NewStore(baseDir string) *Store {
 	return &Store{
 		layout: NewLayout(baseDir),
 	}
+}
+
+// NewChunkStore creates a ChunkStore instance with the given base directory.
+func NewChunkStore(baseDir string) (*ChunkStore, error) {
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return nil, err
+	}
+
+	return &ChunkStore{BaseDir: baseDir}, nil
 }
 
 // Layout returns the underlying storage layout configuration.
@@ -105,6 +119,27 @@ func (s *Store) ReadChunk(fileID string, index int) ([]byte, error) {
 	return os.ReadFile(chunkPath)
 }
 
+// ReadChunk reads a chunk from a CID-scoped chunk store.
+func (s *ChunkStore) ReadChunk(cid string, index int) ([]byte, error) {
+	path := filepath.Join(s.BaseDir, cid, fmt.Sprintf("%d.chunk", index))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read chunk %s/%d: %w", cid, index, err)
+	}
+	return data, nil
+}
+
+// WriteChunk writes a chunk to a CID-scoped chunk store.
+func (s *ChunkStore) WriteChunk(cid string, index int, data []byte) error {
+	dir := filepath.Join(s.BaseDir, cid)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	path := filepath.Join(dir, fmt.Sprintf("%d.chunk", index))
+	return os.WriteFile(path, data, 0644)
+}
+
 // WriteChunksFromReader splits a stream into chunk files and stores them directly to disk.
 func (s *Store) WriteChunksFromReader(src io.Reader, fileID string, chunkSize int) error {
 	if chunkSize <= 0 {
@@ -152,19 +187,15 @@ func (s *Store) StoreModel(srcPath string, fileID string, chunkSize int) (fileme
 		return filemeta.FileMeta{}, "", err
 	}
 
-	// Build the manifest (pure in-memory generation)
-	meta, cid, err := filemeta.BuildManifest(f, fileID, filepath.Base(srcPath), info.Size(), chunkSize)
-	if err != nil {
+	// Build the manifest while writing chunk files in a single streaming pass.
+	if err := s.InitializeFileDirectories(fileID); err != nil {
 		return filemeta.FileMeta{}, "", err
 	}
 
-	// Seek back to the beginning of the file to write chunks
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return filemeta.FileMeta{}, "", fmt.Errorf("seek to start: %w", err)
-	}
-
-	// Write chunks to disk
-	if err := s.WriteChunksFromReader(f, fileID, chunkSize); err != nil {
+	meta, cid, err := filemeta.BuildManifestWithChunkWriter(f, fileID, filepath.Base(srcPath), info.Size(), chunkSize, func(index int, data []byte) error {
+		return s.WriteChunk(fileID, index, data)
+	})
+	if err != nil {
 		return filemeta.FileMeta{}, "", err
 	}
 
