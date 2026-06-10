@@ -137,7 +137,17 @@ func (s *ChunkStore) WriteChunk(cid string, index int, data []byte) error {
 	}
 
 	path := filepath.Join(dir, fmt.Sprintf("%d.chunk", index))
-	return os.WriteFile(path, data, 0644)
+	tmpPath := path + ".tmp"
+
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("write tmp chunk %d: %w", index, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename chunk %d: %w", index, err)
+	}
+
+	return nil
 }
 
 // WriteChunksFromReader splits a stream into chunk files and stores them directly to disk.
