@@ -78,6 +78,14 @@ func (s *Server) acceptLoop() {
 	}
 }
 
+// Addr returns the network address that the server listener is bound to.
+func (s *Server) Addr() net.Addr {
+	if s.listener == nil {
+		return nil
+	}
+	return s.listener.Addr()
+}
+
 // Stop gracefully shuts down the listener and waits for the accept loop to exit.
 func (s *Server) Stop() {
 	close(s.quit)
@@ -86,3 +94,4 @@ func (s *Server) Stop() {
 	}
 	s.wg.Wait()
 }
+
