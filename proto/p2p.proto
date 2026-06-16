@@ -12,6 +12,15 @@ enum MessageType {
     MSG_GET_METADATA_RESPONSE = 4;
     MSG_GET_CHUNK_REQUEST = 5;
     MSG_GET_CHUNK_RESPONSE = 6;
+    // DHT protocol messages (7-14) — defined in internal/protocol/dht.go
+    // MSG_DHT_PING             = 7;
+    // MSG_DHT_PONG             = 8;
+    // MSG_DHT_FIND_NODE        = 9;
+    // MSG_DHT_FIND_NODE_RESP   = 10;
+    // MSG_DHT_FIND_VALUE       = 11;
+    // MSG_DHT_FIND_VALUE_RESP  = 12;
+    // MSG_DHT_STORE            = 13;
+    // MSG_DHT_STORE_RESP       = 14;
 }
 
 message Envelope {
