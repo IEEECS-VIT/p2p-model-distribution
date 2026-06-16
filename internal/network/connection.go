@@ -195,6 +195,69 @@ func (c *Connection) WriteResponse(reqID string, msgType protocol.MessageType, r
 	return c.WriteMessage(envBytes)
 }
 
+// WriteRawResponse writes a pre-serialised payload as a response to a request.
+// This is used by the DHT layer which uses JSON serialisation instead of protobuf.
+func (c *Connection) WriteRawResponse(reqID string, msgType protocol.MessageType, payload []byte) error {
+	env := &protocol.Envelope{
+		Id:      reqID,
+		Type:    msgType,
+		Payload: payload,
+	}
+
+	envBytes, err := proto.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("marshal envelope: %w", err)
+	}
+
+	return c.WriteMessage(envBytes)
+}
+
+// SendRaw sends a pre-serialised payload as a request and waits for the response envelope.
+// This is the raw-payload counterpart of SendRequest, used by the DHT layer.
+func (c *Connection) SendRaw(ctx context.Context, msgType protocol.MessageType, payload []byte) (*protocol.Envelope, error) {
+	reqID := generateUUID()
+
+	env := &protocol.Envelope{
+		Id:      reqID,
+		Type:    msgType,
+		Payload: payload,
+	}
+
+	envBytes, err := proto.Marshal(env)
+	if err != nil {
+		return nil, fmt.Errorf("marshal envelope: %w", err)
+	}
+
+	respChan := make(chan *protocol.Envelope, 1)
+
+	c.mu.Lock()
+	if c.pendingRequests == nil {
+		c.pendingRequests = make(map[string]chan *protocol.Envelope)
+	}
+	c.pendingRequests[reqID] = respChan
+	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		delete(c.pendingRequests, reqID)
+		c.mu.Unlock()
+	}()
+
+	if err := c.WriteMessage(envBytes); err != nil {
+		return nil, fmt.Errorf("write request: %w", err)
+	}
+
+	select {
+	case resp, ok := <-respChan:
+		if !ok {
+			return nil, fmt.Errorf("connection closed during request")
+		}
+		return resp, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // Close gracefully terminates the TCP connection.
 func (c *Connection) Close() error {
 	return c.conn.Close()
