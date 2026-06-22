@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/dht"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/downloader"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/filemeta"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
@@ -243,5 +245,101 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 
 	if !bytes.Equal(assembledContent, originalContent) {
 		t.Error("reassembled file contents do not match the original seeded content")
+	}
+}
+
+func TestEndToEnd_DHTDistribution(t *testing.T) {
+	// 1. Prepare directories
+	seederDir := t.TempDir()
+	downloaderDir := t.TempDir()
+
+	originalContent := make([]byte, 150*1024) // 150 KB
+	for i := range originalContent {
+		originalContent[i] = byte((i*97 + 31) % 256)
+	}
+
+	srcPath := filepath.Join(t.TempDir(), "model.bin")
+	if err := os.WriteFile(srcPath, originalContent, 0644); err != nil {
+		t.Fatalf("failed to write original file: %v", err)
+	}
+
+	// 2. Start Bootstrap Node
+	bootstrapSvc := dht.NewService("bootstrap-node", "127.0.0.1:0", "", nil)
+	if err := bootstrapSvc.Start(); err != nil {
+		t.Fatalf("failed to start bootstrap service: %v", err)
+	}
+	defer bootstrapSvc.Stop()
+	bootstrapAddr := bootstrapSvc.Self().Endpoint()
+
+	// 3. Start Seeder Node with file registered
+	seederStore := storage.NewStore(seederDir)
+	fileID := "dht-model-test-id"
+	_, _, err := seederStore.StoreModel(srcPath, fileID, 20*1024) // 20 KB chunks
+	if err != nil {
+		t.Fatalf("failed to store model on seeder: %v", err)
+	}
+
+	seederSvc := dht.NewService("seeder-node", "127.0.0.1:0", "", []string{bootstrapAddr})
+	
+	// Register file transfer handlers on seeder DHT router
+	seederRouter := seederSvc.Router()
+	seederRouter.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
+		var req protocol.GetMetadataRequest
+		proto.Unmarshal(env.Payload, &req)
+		loadedMeta, _ := seederStore.LoadManifest(req.FileId)
+		mBytes, _ := json.Marshal(loadedMeta)
+		resp := &protocol.GetMetadataResponse{FileId: req.FileId, Success: true, MetadataJson: mBytes}
+		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
+	})
+	seederRouter.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
+		var req protocol.GetChunkRequest
+		proto.Unmarshal(env.Payload, &req)
+		chunkData, _ := seederStore.ReadChunk(req.FileId, int(req.ChunkIndex))
+		resp := &protocol.GetChunkResponse{FileId: req.FileId, ChunkIndex: req.ChunkIndex, Success: true, Data: chunkData}
+		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
+	})
+
+	if err := seederSvc.Start(); err != nil {
+		t.Fatalf("failed to start seeder service: %v", err)
+	}
+	defer seederSvc.Stop()
+
+	// Wait for bootstrap exchange
+	time.Sleep(200 * time.Millisecond)
+
+	// Announce file ID
+	seederSvc.AnnounceProvider(fileID)
+
+	// 4. Start Downloader Node
+	downloaderStore := storage.NewStore(downloaderDir)
+	downloaderSvc := dht.NewService("downloader-node", "127.0.0.1:0", "", []string{bootstrapAddr})
+	if err := downloaderSvc.Start(); err != nil {
+		t.Fatalf("failed to start downloader service: %v", err)
+	}
+	defer downloaderSvc.Stop()
+
+	// Wait for bootstrap exchange
+	time.Sleep(200 * time.Millisecond)
+
+	// 5. Run Downloader with DHT fallback enabled (passing nil initialProviders)
+	dl := downloader.New(fileID, downloaderDir, downloaderSvc, downloaderStore, nil, 2)
+
+	assembledPath := filepath.Join(downloaderDir, "dht-assembled.bin")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err = dl.Download(ctx, assembledPath)
+	if err != nil {
+		t.Fatalf("DHT download failed: %v", err)
+	}
+
+	// 6. Verification
+	assembledContent, err := os.ReadFile(assembledPath)
+	if err != nil {
+		t.Fatalf("failed to read assembled file: %v", err)
+	}
+
+	if !bytes.Equal(assembledContent, originalContent) {
+		t.Error("reassembled file contents in DHT mode do not match original")
 	}
 }

@@ -2,3 +2,7 @@ data-test/
 *.txt
 data/
 seed
+downloaded_model.bin
+bin/
+downloader-data/
+seeder-data/
