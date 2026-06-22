@@ -7,16 +7,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/dht"
-	"github.com/IEEECS-VIT/p2p-model-distribution/internal/filemeta"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/downloader"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
@@ -262,166 +260,17 @@ func runDHDownloader(fileID, outPath, dataDir string, svc *dht.Service, store *s
 	// Wait a moment for bootstrap to discover peers.
 	time.Sleep(2 * time.Second)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	providers := svc.FindProviders(ctx, fileID)
-	if len(providers) == 0 {
-		log.Fatalf("no providers found for file ID %s", fileID)
-	}
+	fmt.Printf("%s[DHT]%s Found %d initial provider(s)\n", colorGreen, colorReset, len(providers))
 
-	fmt.Printf("%s[DHT]%s Found %d provider(s)\n", colorGreen, colorReset, len(providers))
-
-	// Pick the first provider (or ourselves — skip if so).
-	var targetAddr string
-	selfID := svc.Self().ID
-	for _, p := range providers {
-		if p == selfID || p == "" {
-			continue
-		}
-		// Look up the address from the service's address map.
-		// We use the node ID to find the connection.
-		targetAddr = p
-		break
-	}
-
-	// If we only know providers by ID but not address, try to find anyone
-	// in the routing table who can help.
-	if targetAddr == "" {
-		// Try connecting to bootstrap or routing-table peers and ask them.
-		closest := svc.DHT().ClosestPeers(fileID, dht.K)
-		for _, peer := range closest {
-			if peer.ID == selfID {
-				continue
-			}
-			addr := fmt.Sprintf("%s:%d", peer.IP, peer.Port)
-			if addr == ":0" {
-				continue
-			}
-			targetAddr = addr
-			break
-		}
-	}
-
-	if targetAddr == "" {
-		log.Fatalf("could not resolve any provider address for file ID %s", fileID)
-	}
-
-	fmt.Printf("%s[DOWNLOAD]%s Connecting to provider at %s...\n", colorBlue, colorReset, targetAddr)
-
-	rawConn, err := net.Dial("tcp", targetAddr)
+	dl := downloader.New(fileID, dataDir, svc, store, providers, 4)
+	_, err := dl.Download(ctx, outPath)
 	if err != nil {
-		log.Fatalf("failed to connect to provider: %v", err)
+		log.Fatalf("download failed: %v", err)
 	}
-	defer rawConn.Close()
-
-	conn := network.NewConnection(rawConn, "downloader-peer")
-	conn.SetRouter(svc.Router())
-	conn.Start()
-
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel2()
-
-	// 1. Fetch metadata
-	fmt.Printf("%s[DOWNLOAD]%s → Requesting manifest for ID: %s%s%s...\n",
-		colorBlue, colorReset, colorBold, fileID, colorReset)
-	metaReq := &protocol.GetMetadataRequest{FileId: fileID}
-
-	respEnv, err := conn.SendRequest(ctx2, protocol.MessageType_MSG_GET_METADATA_REQUEST, metaReq)
-	if err != nil {
-		log.Fatalf("failed to fetch metadata: %v", err)
-	}
-
-	var metaResp protocol.GetMetadataResponse
-	if err := proto.Unmarshal(respEnv.Payload, &metaResp); err != nil {
-		log.Fatalf("failed to decode metadata response: %v", err)
-	}
-	if !metaResp.Success {
-		log.Fatalf("seeder returned error: %s", metaResp.Error)
-	}
-
-	var meta filemeta.FileMeta
-	if err := json.Unmarshal(metaResp.MetadataJson, &meta); err != nil {
-		log.Fatalf("failed to unmarshal manifest JSON: %v", err)
-	}
-
-	fmt.Printf("%s[DOWNLOAD]%s ✓ Manifest retrieved. File: %s%s%s (%d chunks, size: %.2f MB)\n",
-		colorGreen, colorReset, colorBold, meta.FileName, colorReset, meta.NumChunks, float64(meta.FileSize)/(1024*1024))
-
-	// Initialize downloader folders
-	if err := store.InitializeFileDirectories(fileID); err != nil {
-		log.Fatalf("failed to prepare directories: %v", err)
-	}
-
-	// 2. Fetch all chunks
-	start := time.Now()
-	for i, chunkMeta := range meta.Chunks {
-		fmt.Printf("%s[DOWNLOAD]%s [%d/%d] Fetching chunk %d (%d KB)... ",
-			colorYellow, colorReset, i+1, meta.NumChunks, chunkMeta.Index, chunkMeta.Size/1024)
-
-		chunkReq := &protocol.GetChunkRequest{
-			FileId:     fileID,
-			ChunkIndex: int32(chunkMeta.Index),
-		}
-
-		chunkEnv, err := conn.SendRequest(ctx2, protocol.MessageType_MSG_GET_CHUNK_REQUEST, chunkReq)
-		if err != nil {
-			fmt.Printf("%s[FAIL]%s\n", colorRed, colorReset)
-			log.Fatalf("failed to fetch chunk %d: %v", chunkMeta.Index, err)
-		}
-
-		var chunkResp protocol.GetChunkResponse
-		if err := proto.Unmarshal(chunkEnv.Payload, &chunkResp); err != nil {
-			fmt.Printf("%s[FAIL]%s\n", colorRed, colorReset)
-			log.Fatalf("failed to decode chunk %d response: %v", chunkMeta.Index, err)
-		}
-		if !chunkResp.Success {
-			fmt.Printf("%s[FAIL]%s\n", colorRed, colorReset)
-			log.Fatalf("seeder chunk fetch error: %s", chunkResp.Error)
-		}
-
-		// Verify chunk integrity
-		if err := filemeta.VerifyChunk(chunkResp.Data, chunkMeta.Hash); err != nil {
-			fmt.Printf("%s[CORRUPT]%s\n", colorRed, colorReset)
-			log.Fatalf("chunk integrity verification failed: %v", err)
-		}
-
-		// Save to disk
-		if err := store.WriteChunk(fileID, chunkMeta.Index, chunkResp.Data); err != nil {
-			fmt.Printf("%s[FAIL]%s\n", colorRed, colorReset)
-			log.Fatalf("failed to write chunk to storage: %v", err)
-		}
-
-		fmt.Printf("%s[OK]%s\n", colorGreen, colorReset)
-	}
-
-	// Save manifest
-	if err := store.SaveManifest(meta); err != nil {
-		log.Fatalf("failed to save manifest: %v", err)
-	}
-
-	duration := time.Since(start)
-	fmt.Printf("%s[DOWNLOAD]%s ✓ All chunks downloaded and verified in %v!\n", colorGreen, colorReset, duration)
-
-	// 3. Reassemble
-	if outPath == "" {
-		outPath = filepath.Join(os.TempDir(), meta.FileName)
-	}
-	fmt.Printf("%s[DOWNLOAD]%s Reassembling chunks into: %s%s%s...\n",
-		colorBlue, colorReset, colorBold, outPath, colorReset)
-
-	if err := filemeta.AssembleChunks(store.Layout().ChunksDir(fileID), outPath, meta.Chunks); err != nil {
-		log.Fatalf("reassembly failed: %v", err)
-	}
-
-	// 4. Final integrity check
-	fmt.Printf("%s[DOWNLOAD]%s Running final SHA-256 validation...\n", colorBlue, colorReset)
-	if err := filemeta.VerifyFile(outPath, meta.ModelHash); err != nil {
-		log.Fatalf("final file integrity check failed: %v", err)
-	}
-
-	fmt.Printf("%s[DOWNLOAD]%s %s★ SUCCESS! File reassembled and hash verified ★%s\n",
-		colorGreen, colorReset, colorBold, colorReset)
 }
 
 //---------------------------------------------------------------------
@@ -535,112 +384,15 @@ func runSeeder(port, filePath, dataDir string, chunkSize int) {
 // Legacy downloader (no DHT)
 
 func runDownloader(seederAddr, fileID, dataDir, outPath string) {
-	fmt.Printf("%s[DOWNLOAD]%s Connecting to seeder at %s%s%s...\n", colorBlue, colorReset, colorBold, seederAddr, colorReset)
-
-	rawConn, err := net.Dial("tcp", seederAddr)
-	if err != nil {
-		log.Fatalf("failed to connect to seeder: %v", err)
-	}
-	defer rawConn.Close()
-
-	conn := network.NewConnection(rawConn, "downloader-peer")
-	conn.Start()
-
 	store := storage.NewStore(dataDir)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	fmt.Printf("%s[DOWNLOAD]%s → Requesting manifest for ID: %s%s%s...\n", colorBlue, colorReset, colorBold, fileID, colorReset)
-	metaReq := &protocol.GetMetadataRequest{FileId: fileID}
-
-	respEnv, err := conn.SendRequest(ctx, protocol.MessageType_MSG_GET_METADATA_REQUEST, metaReq)
+	dl := downloader.New(fileID, dataDir, nil, store, []string{seederAddr}, 4)
+	_, err := dl.Download(ctx, outPath)
 	if err != nil {
-		log.Fatalf("failed to fetch metadata: %v", err)
+		log.Fatalf("download failed: %v", err)
 	}
-
-	var metaResp protocol.GetMetadataResponse
-	if err := proto.Unmarshal(respEnv.Payload, &metaResp); err != nil {
-		log.Fatalf("failed to decode metadata response: %v", err)
-	}
-	if !metaResp.Success {
-		log.Fatalf("seeder returned error: %s", metaResp.Error)
-	}
-
-	var meta filemeta.FileMeta
-	if err := json.Unmarshal(metaResp.MetadataJson, &meta); err != nil {
-		log.Fatalf("failed to unmarshal manifest JSON: %v", err)
-	}
-
-	fmt.Printf("%s[DOWNLOAD]%s ✓ Manifest retrieved. File: %s%s%s (%d chunks, size: %.2f MB)\n",
-		colorGreen, colorReset, colorBold, meta.FileName, colorReset, meta.NumChunks, float64(meta.FileSize)/(1024*1024))
-
-	if err := store.InitializeFileDirectories(fileID); err != nil {
-		log.Fatalf("failed to prepare directories: %v", err)
-	}
-
-	start := time.Now()
-	for i, chunkMeta := range meta.Chunks {
-		fmt.Printf("%s[DOWNLOAD]%s [%d/%d] Fetching chunk %d (%d KB)... ",
-			colorYellow, colorReset, i+1, meta.NumChunks, chunkMeta.Index, chunkMeta.Size/1024)
-
-		chunkReq := &protocol.GetChunkRequest{
-			FileId:     fileID,
-			ChunkIndex: int32(chunkMeta.Index),
-		}
-
-		chunkEnv, err := conn.SendRequest(ctx, protocol.MessageType_MSG_GET_CHUNK_REQUEST, chunkReq)
-		if err != nil {
-			fmt.Printf("%s[FAIL]%s\n", colorRed, colorReset)
-			log.Fatalf("failed to fetch chunk %d: %v", chunkMeta.Index, err)
-		}
-
-		var chunkResp protocol.GetChunkResponse
-		if err := proto.Unmarshal(chunkEnv.Payload, &chunkResp); err != nil {
-			fmt.Printf("%s[FAIL]%s\n", colorRed, colorReset)
-			log.Fatalf("failed to decode chunk %d response: %v", chunkMeta.Index, err)
-		}
-		if !chunkResp.Success {
-			fmt.Printf("%s[FAIL]%s\n", colorRed, colorReset)
-			log.Fatalf("seeder chunk fetch error: %s", chunkResp.Error)
-		}
-
-		if err := filemeta.VerifyChunk(chunkResp.Data, chunkMeta.Hash); err != nil {
-			fmt.Printf("%s[CORRUPT]%s\n", colorRed, colorReset)
-			log.Fatalf("chunk integrity verification failed: %v", err)
-		}
-
-		if err := store.WriteChunk(fileID, chunkMeta.Index, chunkResp.Data); err != nil {
-			fmt.Printf("%s[FAIL]%s\n", colorRed, colorReset)
-			log.Fatalf("failed to write chunk to storage: %v", err)
-		}
-
-		fmt.Printf("%s[OK]%s\n", colorGreen, colorReset)
-	}
-
-	if err := store.SaveManifest(meta); err != nil {
-		log.Fatalf("failed to save manifest: %v", err)
-	}
-
-	duration := time.Since(start)
-	fmt.Printf("%s[DOWNLOAD]%s ✓ All chunks downloaded and verified in %v!\n", colorGreen, colorReset, duration)
-
-	if outPath == "" {
-		outPath = filepath.Join(os.TempDir(), meta.FileName)
-	}
-	fmt.Printf("%s[DOWNLOAD]%s Reassembling chunks into target destination: %s%s%s...\n",
-		colorBlue, colorReset, colorBold, outPath, colorReset)
-
-	if err := filemeta.AssembleChunks(store.Layout().ChunksDir(fileID), outPath, meta.Chunks); err != nil {
-		log.Fatalf("reassembly failed: %v", err)
-	}
-
-	fmt.Printf("%s[DOWNLOAD]%s Running final file SHA-256 validation...\n", colorBlue, colorReset)
-	if err := filemeta.VerifyFile(outPath, meta.ModelHash); err != nil {
-		log.Fatalf("final file integrity check failed: %v", err)
-	}
-
-	fmt.Printf("%s[DOWNLOAD]%s %s★ SUCCESS! File reassembled and hash verified cleanly ★%s\n",
-		colorGreen, colorReset, colorBold, colorReset)
 }
 
 //---------------------------------------------------------------------

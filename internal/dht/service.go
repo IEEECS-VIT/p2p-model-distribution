@@ -97,6 +97,14 @@ func (s *Service) Start() error {
 		return fmt.Errorf("start server: %w", err)
 	}
 
+	// Update self port if it was ephemeral
+	if addr, ok := s.server.Addr().(*net.TCPAddr); ok {
+		s.self.Port = addr.Port
+		if s.dht != nil {
+			s.dht.Self.Port = addr.Port
+		}
+	}
+
 	log.Printf("[DHT] Node %s listening on %s (advertised: %s:%d)",
 		s.self.ID, s.listen, s.self.IP, s.self.Port)
 
@@ -142,17 +150,15 @@ func (s *Service) AnnounceProvider(key string) {
 	for _, c := range peers {
 		go func(conn *network.Connection) {
 			body := &protocol.DHTMessageBody{
-				Type:   "STORE",
-				FromID: s.self.ID,
-				Key:    key,
-			}
-			payload, err := protocol.MarshalDHTMessage(body)
-			if err != nil {
-				return
+				Type:     "STORE",
+				FromID:   s.self.ID,
+				FromIP:   s.self.IP,
+				FromPort: s.self.Port,
+				Key:      key,
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_, _ = conn.SendRaw(ctx, protocol.MSG_DHT_STORE, payload)
+			_, _ = s.sendDHTRequest(ctx, conn, protocol.MSG_DHT_STORE, body)
 		}(c)
 	}
 }
@@ -170,7 +176,10 @@ func (s *Service) FindProviders(ctx context.Context, key string) []string {
 	providers := append([]string(nil), local...)
 
 	// Query closest peers from routing table.
+	s.mu.RLock()
 	closest := s.dht.ClosestPeers(key, K)
+	s.mu.RUnlock()
+
 	for _, peer := range closest {
 		if seen[peer.ID] {
 			continue
@@ -183,20 +192,16 @@ func (s *Service) FindProviders(ctx context.Context, key string) []string {
 		}
 
 		body := &protocol.DHTMessageBody{
-			Type:   "FIND_VALUE",
-			FromID: s.self.ID,
-			Key:    key,
+			Type:     "FIND_VALUE",
+			FromID:   s.self.ID,
+			FromIP:   s.self.IP,
+			FromPort: s.self.Port,
+			Key:      key,
 		}
-		payload, _ := protocol.MarshalDHTMessage(body)
 
 		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		respEnv, err := conn.SendRaw(reqCtx, protocol.MSG_DHT_FIND_VALUE, payload)
+		resp, err := s.sendDHTRequest(reqCtx, conn, protocol.MSG_DHT_FIND_VALUE, body)
 		cancel()
-		if err != nil {
-			continue
-		}
-
-		resp, err := protocol.UnmarshalDHTMessage(respEnv.Payload)
 		if err != nil {
 			continue
 		}
@@ -224,6 +229,88 @@ func (s *Service) AddPeerAddr(peerID, addr string) {
 	s.addrs[peerID] = addr
 	s.mu.Unlock()
 }
+
+// ResolvePeerID returns the dialable address for a peer ID by checking either the
+// registered addrs map or scanning the routing table buckets.
+func (s *Service) ResolvePeerID(peerID string) (string, bool) {
+	s.mu.RLock()
+	addr, ok := s.addrs[peerID]
+	s.mu.RUnlock()
+	if ok && addr != "" {
+		return addr, true
+	}
+
+	// Scan routing table
+	if s.dht != nil && s.dht.RoutingTable != nil {
+		for _, b := range s.dht.RoutingTable.Buckets {
+			for _, p := range b.Peers {
+				if p.ID == peerID {
+					endpoint := p.Endpoint()
+					if endpoint != "" {
+						return endpoint, true
+					}
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// QueryNodeAddress queries the DHT network for a peer ID to resolve its dialable IP and Port.
+func (s *Service) QueryNodeAddress(ctx context.Context, targetID string) (string, bool) {
+	// 1. Check local cache/routing table first
+	if addr, ok := s.ResolvePeerID(targetID); ok && addr != "" {
+		return addr, true
+	}
+
+	// 2. Query closest peers for the target ID
+	s.mu.RLock()
+	closest := s.dht.ClosestPeers(targetID, K)
+	s.mu.RUnlock()
+
+	for _, peer := range closest {
+		if peer.ID == s.self.ID {
+			continue
+		}
+		s.mu.RLock()
+		conn, ok := s.conns[peer.ID]
+		s.mu.RUnlock()
+		if !ok {
+			continue
+		}
+
+		body := &protocol.DHTMessageBody{
+			Type:     "FIND_NODE",
+			FromID:   s.self.ID,
+			FromIP:   s.self.IP,
+			FromPort: s.self.Port,
+			TargetID: targetID,
+		}
+
+		reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		resp, err := s.sendDHTRequest(reqCtx, conn, protocol.MSG_DHT_FIND_NODE, body)
+		cancel()
+		if err != nil {
+			continue
+		}
+
+		// Look through the returned nodes to find the targetID
+		for _, n := range resp.Nodes {
+			// Add to local routing table so we store the address
+			s.dht.AddPeer(Node{ID: n.ID, IP: n.IP, Port: n.Port})
+			if n.ID == targetID {
+				endpoint := fmt.Sprintf("%s:%d", n.IP, n.Port)
+				if n.IP != "" && n.Port != 0 {
+					return endpoint, true
+				}
+			}
+		}
+	}
+
+	return "", false
+}
+
+
 
 // GetConnection returns (or creates) a connection to a peer by address.
 func (s *Service) GetConnection(addr string) (*network.Connection, error) {
@@ -254,6 +341,45 @@ func (s *Service) GetConnection(addr string) (*network.Connection, error) {
 	return conn, nil
 }
 
+func (s *Service) sendDHTRequest(ctx context.Context, conn *network.Connection, msgType protocol.MessageType, body *protocol.DHTMessageBody) (*protocol.DHTMessageBody, error) {
+	payload, err := protocol.MarshalDHTMessage(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	respEnv, err := conn.SendRaw(ctx, msgType, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := protocol.UnmarshalDHTMessage(respEnv.Payload)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal response: %w", err)
+	}
+
+	// Update connection mapping with the peer's resolved ID
+	if resp.FromID != "" {
+		s.mu.Lock()
+		// Remove old addr-based or different ID-based key for the same connection
+		for k, v := range s.conns {
+			if v == conn && k != resp.FromID {
+				delete(s.conns, k)
+				break
+			}
+		}
+		s.conns[resp.FromID] = conn
+		s.addrs[resp.FromID] = conn.RemoteAddr().String()
+		s.mu.Unlock()
+
+		if resp.FromIP != "" && resp.FromPort != 0 {
+			s.dht.AddPeer(Node{ID: resp.FromID, IP: resp.FromIP, Port: resp.FromPort})
+		}
+	}
+
+	return resp, nil
+}
+
+
 //---------------------------------------------------------------------
 // Internal
 
@@ -276,7 +402,7 @@ func (s *Service) handleDHTMessage(conn *network.Connection, env *protocol.Envel
 		TargetID: body.TargetID,
 		Key:      body.Key,
 		Value:    body.Value,
-		From:     s.resolvePeer(body.FromID, conn),
+		From:     s.resolvePeer(body, conn),
 		To:       s.self,
 	}
 
@@ -302,6 +428,8 @@ func (s *Service) handleDHTMessage(conn *network.Connection, env *protocol.Envel
 	respBody := &protocol.DHTMessageBody{
 		Type:      resp.Type,
 		FromID:    s.self.ID,
+		FromIP:    s.self.IP,
+		FromPort:  s.self.Port,
 		TargetID:  resp.TargetID,
 		Key:       resp.Key,
 		Value:     resp.Value,
@@ -326,11 +454,16 @@ func (s *Service) handleDHTMessage(conn *network.Connection, env *protocol.Envel
 // resolvePeer maps a FromID from a wire message to a dht.Node.
 // If we don't have the peer in our routing table, we extract
 // address info from the connection and add it.
-func (s *Service) resolvePeer(fromID string, conn *network.Connection) Node {
+func (s *Service) resolvePeer(body *protocol.DHTMessageBody, conn *network.Connection) Node {
+	fromID := body.FromID
 	// Check routing table first.
 	for _, b := range s.dht.RoutingTable.Buckets {
 		for _, p := range b.Peers {
 			if p.ID == fromID {
+				if body.FromPort != 0 && p.Port != body.FromPort {
+					p.Port = body.FromPort
+					s.dht.AddPeer(p)
+				}
 				return p
 			}
 		}
@@ -341,6 +474,13 @@ func (s *Service) resolvePeer(fromID string, conn *network.Connection) Node {
 	ip, portStr := splitHostPort(addr)
 	port := 0
 	_, _ = fmt.Sscanf(portStr, "%d", &port)
+
+	if body.FromIP != "" {
+		ip = body.FromIP
+	}
+	if body.FromPort != 0 {
+		port = body.FromPort
+	}
 
 	node := Node{ID: fromID, IP: ip, Port: port}
 	s.dht.AddPeer(node)
@@ -378,20 +518,16 @@ func (s *Service) bootstrapOnce() {
 		body := &protocol.DHTMessageBody{
 			Type:     "FIND_NODE",
 			FromID:   s.self.ID,
+			FromIP:   s.self.IP,
+			FromPort: s.self.Port,
 			TargetID: s.self.ID,
 		}
-		payload, _ := protocol.MarshalDHTMessage(body)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		respEnv, err := conn.SendRaw(ctx, protocol.MSG_DHT_FIND_NODE, payload)
+		resp, err := s.sendDHTRequest(ctx, conn, protocol.MSG_DHT_FIND_NODE, body)
 		cancel()
 		if err != nil {
 			log.Printf("[DHT] bootstrap FIND_NODE to %s: %v", addr, err)
-			continue
-		}
-
-		resp, err := protocol.UnmarshalDHTMessage(respEnv.Payload)
-		if err != nil {
 			continue
 		}
 
