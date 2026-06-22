@@ -136,7 +136,7 @@ func (s *Service) Stop() {
 // AnnounceProvider records this node as a provider for the given key
 // (typically a file ID or chunk hash) in the local DHT store and
 // propagates a STORE message to nearby peers so the record spreads.
-func (s *Service) AnnounceProvider(key string) {
+func (s *Service) AnnounceProvider(key string) int {
 	s.dht.RecordProvider(key, s.self.ID)
 
 	// Propagate to every connected peer so the record spreads.
@@ -161,6 +161,14 @@ func (s *Service) AnnounceProvider(key string) {
 			_, _ = s.sendDHTRequest(ctx, conn, protocol.MSG_DHT_STORE, body)
 		}(c)
 	}
+	return len(peers)
+}
+
+// ConnectedPeersCount returns the number of active peer connections.
+func (s *Service) ConnectedPeersCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.conns)
 }
 
 // FindProviders queries connected peers for providers of the given key.
