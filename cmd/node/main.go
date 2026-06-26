@@ -116,15 +116,23 @@ func runWithDHT(mode, port, filePath, dataDir string, chunkSize int,
 		colorCyan, colorReset, colorBold, self.ID, colorReset, self.IP, self.Port)
 
 	// Clean shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
 
+	go func() {
+		<-shutdown
+		cancel()
+	}()
+
 	if mode == "seed" {
-		runDHSeeder(filePath, dataDir, chunkSize, svc, store)
-		<-shutdown
+		runDHSeeder(ctx, filePath, dataDir, chunkSize, svc, store, len(seeds) > 0)
+		<-ctx.Done()
 	} else if mode == "download" {
-		runDHDownloader(fileID, outPath, dataDir, svc, store)
-		<-shutdown
+		runDHDownloader(ctx, fileID, outPath, dataDir, svc, store)
+		<-ctx.Done()
 	} else {
 		fmt.Printf("%s[ERROR]%s invalid mode '%s'\n", colorRed, colorReset, mode)
 		svc.Stop()
@@ -201,7 +209,7 @@ func registerFileHandlers(router *network.Router, store *storage.Store) {
 //---------------------------------------------------------------------
 // DHT Seeder
 
-func runDHSeeder(filePath, dataDir string, chunkSize int, svc *dht.Service, store *storage.Store) {
+func runDHSeeder(ctx context.Context, filePath, dataDir string, chunkSize int, svc *dht.Service, store *storage.Store, hasBootstrap bool) {
 	fileID := ""
 
 	if filePath != "" {
@@ -223,22 +231,97 @@ func runDHSeeder(filePath, dataDir string, chunkSize int, svc *dht.Service, stor
 		fmt.Printf("%s[SEEDER]%s ✓ File ID: %s%s%s (Use this ID to download)\n", colorGreen, colorReset, colorBold, fileID, colorReset)
 		fmt.Printf("%s[SEEDER]%s ✓ Manifest CID: %s\n", colorGreen, colorReset, cid)
 
+		// Wait for at least one peer connection if we have bootstrap peers configured,
+		// so that the initial announcement doesn't go into a black hole.
+		if hasBootstrap {
+			fmt.Printf("%s[DHT]%s Waiting up to 10s for connection to bootstrap peers...\n", colorBlue, colorReset)
+			for i := 0; i < 10; i++ {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					if svc.ConnectedPeersCount() > 0 {
+						goto connected
+					}
+					time.Sleep(1 * time.Second)
+				}
+			}
+		}
+
+	connected:
 		// Announce file ID and each chunk hash in the DHT.
 		fmt.Printf("%s[DHT]%s Announcing file in DHT...\n", colorBlue, colorReset)
-		svc.AnnounceProvider(fileID)
+		numPeers := svc.AnnounceProvider(fileID)
 		for _, c := range meta.Chunks {
 			svc.AnnounceProvider(c.CID)
 		}
-		fmt.Printf("%s[DHT]%s ✓ File announced to %d connected peers\n", colorGreen, colorReset, len(svc.Self().ID))
+		fmt.Printf("%s[DHT]%s ✓ File announced to %d connected peers\n", colorGreen, colorReset, numPeers)
+
+		// Periodically re-announce in the background to handle node churn/re-joins
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					svc.AnnounceProvider(fileID)
+					for _, c := range meta.Chunks {
+						svc.AnnounceProvider(c.CID)
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
 	} else {
 		// Serving existing data: try to discover FileIDs from the data directory.
 		entries, err := os.ReadDir(dataDir)
+		var fileIDs []string
 		if err == nil {
 			for _, e := range entries {
 				if e.IsDir() {
-					svc.AnnounceProvider(e.Name())
+					fileIDs = append(fileIDs, e.Name())
 				}
 			}
+		}
+
+		if len(fileIDs) > 0 {
+			if hasBootstrap {
+				fmt.Printf("%s[DHT]%s Waiting up to 10s for connection to bootstrap peers...\n", colorBlue, colorReset)
+				for i := 0; i < 10; i++ {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+						if svc.ConnectedPeersCount() > 0 {
+							goto existingConnected
+						}
+						time.Sleep(1 * time.Second)
+					}
+				}
+			}
+
+		existingConnected:
+			fmt.Printf("%s[DHT]%s Announcing %d existing files in DHT...\n", colorBlue, colorReset, len(fileIDs))
+			for _, fid := range fileIDs {
+				svc.AnnounceProvider(fid)
+			}
+
+			// Periodically re-announce in the background
+			go func() {
+				ticker := time.NewTicker(30 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						for _, fid := range fileIDs {
+							svc.AnnounceProvider(fid)
+						}
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
 		}
 		fmt.Printf("%s[SEEDER]%s Serving existing data from: %s\n", colorBlue, colorReset, dataDir)
 	}
@@ -249,7 +332,7 @@ func runDHSeeder(filePath, dataDir string, chunkSize int, svc *dht.Service, stor
 //---------------------------------------------------------------------
 // DHT Downloader
 
-func runDHDownloader(fileID, outPath, dataDir string, svc *dht.Service, store *storage.Store) {
+func runDHDownloader(ctx context.Context, fileID, outPath, dataDir string, svc *dht.Service, store *storage.Store) {
 	if fileID == "" {
 		log.Fatalf("-file-id is required for download mode")
 	}
@@ -257,17 +340,30 @@ func runDHDownloader(fileID, outPath, dataDir string, svc *dht.Service, store *s
 	fmt.Printf("%s[DHT]%s Looking up providers for File ID: %s%s%s...\n",
 		colorBlue, colorReset, colorBold, fileID, colorReset)
 
-	// Wait a moment for bootstrap to discover peers.
-	time.Sleep(2 * time.Second)
+	dlCtx, dlCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer dlCancel()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	// Query DHT network for providers, retrying up to 15 seconds to allow background bootstrap connection.
+	var providers []string
+	fmt.Printf("%s[DHT]%s Querying DHT network for provider endpoints...\n", colorBlue, colorReset)
+	for i := 0; i < 15; i++ {
+		select {
+		case <-dlCtx.Done():
+			log.Fatalf("download cancelled or timed out before discovery")
+		default:
+			providers = svc.FindProviders(dlCtx, fileID)
+			if len(providers) > 0 {
+				goto foundProviders
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}
 
-	providers := svc.FindProviders(ctx, fileID)
+foundProviders:
 	fmt.Printf("%s[DHT]%s Found %d initial provider(s)\n", colorGreen, colorReset, len(providers))
 
 	dl := downloader.New(fileID, dataDir, svc, store, providers, 4)
-	_, err := dl.Download(ctx, outPath)
+	_, err := dl.Download(dlCtx, outPath)
 	if err != nil {
 		log.Fatalf("download failed: %v", err)
 	}
