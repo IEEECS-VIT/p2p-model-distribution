@@ -236,6 +236,12 @@ func (d *Downloader) downloadManifest(ctx context.Context) (filemeta.FileMeta, e
 			continue
 		}
 
+		if err := meta.Validate(); err != nil {
+			lastErr = fmt.Errorf("provider sent invalid manifest: %w", err)
+			d.markProviderFailed(addr, lastErr)
+			continue
+		}
+
 		// Reset failure count on success
 		d.mu.Lock()
 		d.providerFailures[addr] = 0
