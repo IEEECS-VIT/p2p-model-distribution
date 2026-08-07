@@ -44,6 +44,10 @@ func (s *Store) Layout() *Layout {
 
 // InitializeFileDirectories creates the chunk and base directories for a specific fileID.
 func (s *Store) InitializeFileDirectories(fileID string) error {
+	if !ValidFileID(fileID) {
+		return fmt.Errorf("initialize directories for %q: %w", fileID, ErrInvalidFileID)
+	}
+
 	chunksDir := s.layout.ChunksDir(fileID)
 	if err := os.MkdirAll(chunksDir, 0755); err != nil {
 		return fmt.Errorf("create chunks dir: %w", err)
@@ -79,6 +83,10 @@ func (s *Store) SaveManifest(meta filemeta.FileMeta) error {
 
 // LoadManifest reads the manifest file from the file's storage directory.
 func (s *Store) LoadManifest(fileID string) (filemeta.FileMeta, error) {
+	if !ValidFileID(fileID) {
+		return filemeta.FileMeta{}, fmt.Errorf("load manifest for %q: %w", fileID, ErrInvalidFileID)
+	}
+
 	path := s.layout.ManifestPath(fileID)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -115,6 +123,10 @@ func (s *Store) WriteChunk(fileID string, index int, data []byte) error {
 
 // ReadChunk reads a chunk's content from the chunks storage directory.
 func (s *Store) ReadChunk(fileID string, index int) ([]byte, error) {
+	if !ValidFileID(fileID) {
+		return nil, fmt.Errorf("read chunk for %q: %w", fileID, ErrInvalidFileID)
+	}
+
 	chunkPath := filepath.Join(s.layout.ChunksDir(fileID), fmt.Sprintf("%d.chunk", index))
 	return os.ReadFile(chunkPath)
 }
