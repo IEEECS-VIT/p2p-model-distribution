@@ -7,7 +7,7 @@ type Transport interface {
 type DHT struct {
 	Self           Node
 	RoutingTable   *RoutingTable
-	Providers      ProviderStore
+	Providers      *ProviderStore
 	Transport      Transport
 	BootstrapPeers []Node
 }

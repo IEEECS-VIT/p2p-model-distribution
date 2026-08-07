@@ -1,37 +1,53 @@
 package dht
 
+import "sync"
+
 //store maintains provider records mapping chunk hashes to provider Node IDs.
+//It is safe for concurrent use, since it is read and written from
+//per-connection RPC handler goroutines.
 
-type ProviderStore map[string][]string
-
-func NewStore() ProviderStore {
-	return make(ProviderStore)
+type ProviderStore struct {
+	mu   sync.RWMutex
+	data map[string][]string
 }
 
-func (s ProviderStore) Add(chunk string, providerID string) {
+func NewStore() *ProviderStore {
+	return &ProviderStore{data: make(map[string][]string)}
+}
+
+func (s *ProviderStore) Add(chunk string, providerID string) {
 	if chunk == "" || providerID == "" {
 		return
 	}
 
-	providers := s[chunk]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	providers := s.data[chunk]
 	for _, existing := range providers {
 		if existing == providerID {
 			return
 		}
 	}
 
-	s[chunk] = append(providers, providerID)
+	s.data[chunk] = append(providers, providerID)
 }
 
-func (s ProviderStore) Get(chunk string) []string {
-	providers := s[chunk]
+func (s *ProviderStore) Get(chunk string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	providers := s.data[chunk]
 	result := make([]string, len(providers))
 	copy(result, providers)
 	return result
 }
 
-func (s ProviderStore) Remove(chunk string, providerID string) {
-	providers := s[chunk]
+func (s *ProviderStore) Remove(chunk string, providerID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	providers := s.data[chunk]
 	filtered := providers[:0]
 	for _, existing := range providers {
 		if existing != providerID {
@@ -40,9 +56,9 @@ func (s ProviderStore) Remove(chunk string, providerID string) {
 	}
 
 	if len(filtered) == 0 {
-		delete(s, chunk)
+		delete(s.data, chunk)
 		return
 	}
 
-	s[chunk] = filtered
+	s.data[chunk] = filtered
 }

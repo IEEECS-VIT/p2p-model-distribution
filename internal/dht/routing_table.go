@@ -3,12 +3,16 @@ package dht
 import (
 	"bytes"
 	"sort"
+	"sync"
 )
 
-// routingTable holds k-buckets for a node.
+// RoutingTable holds k-buckets for a node. It is safe for concurrent use,
+// since it is read and written from per-connection RPC handler goroutines.
 type RoutingTable struct {
 	SelfID  string
 	Buckets []*Bucket
+
+	mu sync.RWMutex
 }
 
 const (
@@ -30,6 +34,9 @@ func (rt *RoutingTable) AddNode(node Node) {
 		return
 	}
 
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+
 	bucket := rt.bucketFor(node.ID)
 	if bucket == nil {
 		return
@@ -43,6 +50,9 @@ func (rt *RoutingTable) ClosestNodes(targetID string, count int) []Node {
 		return nil
 	}
 
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+
 	var peers []Node
 	seen := make(map[string]struct{}) //deduplication
 	for _, bucket := range rt.Buckets {
@@ -53,7 +63,7 @@ func (rt *RoutingTable) ClosestNodes(targetID string, count int) []Node {
 			if _, ok := seen[peer.ID]; ok {
 				continue
 			}
-			seen[peer.ID] = struct{}{} 
+			seen[peer.ID] = struct{}{}
 			peers = append(peers, peer)
 		}
 	}
@@ -67,6 +77,26 @@ func (rt *RoutingTable) ClosestNodes(targetID string, count int) []Node {
 	}
 
 	return peers
+}
+
+// FindNode looks up a peer by ID across all buckets. Callers must not
+// reach into Buckets/Peers directly, since that bypasses locking.
+func (rt *RoutingTable) FindNode(id string) (Node, bool) {
+	if rt == nil {
+		return Node{}, false
+	}
+
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+
+	for _, b := range rt.Buckets {
+		for _, p := range b.Peers {
+			if p.ID == id {
+				return p, true
+			}
+		}
+	}
+	return Node{}, false
 }
 
 func (rt *RoutingTable) bucketFor(peerID string) *Bucket {

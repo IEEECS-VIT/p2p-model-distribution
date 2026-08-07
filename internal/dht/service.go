@@ -250,14 +250,9 @@ func (s *Service) ResolvePeerID(peerID string) (string, bool) {
 
 	// Scan routing table
 	if s.dht != nil && s.dht.RoutingTable != nil {
-		for _, b := range s.dht.RoutingTable.Buckets {
-			for _, p := range b.Peers {
-				if p.ID == peerID {
-					endpoint := p.Endpoint()
-					if endpoint != "" {
-						return endpoint, true
-					}
-				}
+		if p, ok := s.dht.RoutingTable.FindNode(peerID); ok {
+			if endpoint := p.Endpoint(); endpoint != "" {
+				return endpoint, true
 			}
 		}
 	}
@@ -465,16 +460,12 @@ func (s *Service) handleDHTMessage(conn *network.Connection, env *protocol.Envel
 func (s *Service) resolvePeer(body *protocol.DHTMessageBody, conn *network.Connection) Node {
 	fromID := body.FromID
 	// Check routing table first.
-	for _, b := range s.dht.RoutingTable.Buckets {
-		for _, p := range b.Peers {
-			if p.ID == fromID {
-				if body.FromPort != 0 && p.Port != body.FromPort {
-					p.Port = body.FromPort
-					s.dht.AddPeer(p)
-				}
-				return p
-			}
+	if p, ok := s.dht.RoutingTable.FindNode(fromID); ok {
+		if body.FromPort != 0 && p.Port != body.FromPort {
+			p.Port = body.FromPort
+			s.dht.AddPeer(p)
 		}
+		return p
 	}
 
 	// Unknown peer — add it with the connection's remote address.
