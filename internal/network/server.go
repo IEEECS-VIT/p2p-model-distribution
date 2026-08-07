@@ -4,7 +4,15 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 )
+
+// DefaultMaxConnections caps how many inbound peer connections a Server will
+// accept concurrently. Without a cap, a single peer (or many) opening
+// connections in a loop can exhaust file descriptors/memory. Connections
+// beyond the cap are accepted and immediately closed rather than left
+// queued, so the accept loop never blocks.
+const DefaultMaxConnections = 512
 
 // Server handles listening for incoming TCP connections from other peers.
 type Server struct {
@@ -19,14 +27,27 @@ type Server struct {
 	quit chan struct{}
 	// wg ensures we wait for all internal goroutines to finish before exiting.
 	wg sync.WaitGroup
+
+	// maxConns is the concurrent inbound connection cap.
+	maxConns atomic.Int32
+	// activeConns tracks how many accepted connections are currently open.
+	activeConns atomic.Int32
 }
 
 // NewServer creates a new P2P TCP server.
 func NewServer(listenAddr string) *Server {
-	return &Server{
+	s := &Server{
 		listenAddr: listenAddr,
 		quit:       make(chan struct{}),
 	}
+	s.maxConns.Store(DefaultMaxConnections)
+	return s
+}
+
+// SetMaxConnections overrides the concurrent inbound connection cap. Must be
+// called before Start.
+func (s *Server) SetMaxConnections(n int) {
+	s.maxConns.Store(int32(n))
 }
 
 // Start opens the TCP port and begins accepting connections.
@@ -61,10 +82,22 @@ func (s *Server) acceptLoop() {
 			}
 		}
 
-		// Wrap the raw net.Conn. 
+		if s.activeConns.Add(1) > s.maxConns.Load() {
+			// Over the concurrent connection cap: reject immediately
+			// instead of letting an unbounded number of peers hold a
+			// goroutine and file descriptor open.
+			s.activeConns.Add(-1)
+			conn.Close()
+			continue
+		}
+
+		// Wrap the raw net.Conn.
 		// At this raw TCP stage, we don't know the cryptographic PeerID yet,
 		// so we temporarily use the remote IP address.
 		wrappedConn := NewConnection(conn, conn.RemoteAddr().String())
+		wrappedConn.SetOnClose(func() {
+			s.activeConns.Add(-1)
+		})
 
 		if s.OnNewConnection != nil {
 			// Spawn a new goroutine to handle this connection.
@@ -73,9 +106,17 @@ func (s *Server) acceptLoop() {
 			go s.OnNewConnection(wrappedConn)
 		} else {
 			// If no one is listening for connections, close it to avoid leaks.
+			// The read loop never started, so onClose won't fire; account
+			// for the slot here instead.
 			wrappedConn.Close()
+			s.activeConns.Add(-1)
 		}
 	}
+}
+
+// ActiveConnections returns the current number of accepted, open connections.
+func (s *Server) ActiveConnections() int {
+	return int(s.activeConns.Load())
 }
 
 // Addr returns the network address that the server listener is bound to.
