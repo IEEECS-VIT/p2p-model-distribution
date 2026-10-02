@@ -26,16 +26,16 @@ type DHTNode struct {
 // for DHT RPCs.  JSON is used instead of a separate protobuf message so we
 // don't need protoc to extend the schema.
 type DHTMessageBody struct {
-	Type      string     `json:"type"`                // mirrors dht.Message.Type
-	FromID    string     `json:"from_id"`             // sending peer's node ID
-	FromIP    string     `json:"from_ip,omitempty"`   // sending peer's listener IP
-	FromPort  int        `json:"from_port,omitempty"` // sending peer's listener Port
-	TargetID  string     `json:"target_id,omitempty"` // for FIND_NODE / FIND_VALUE
-	Key       string     `json:"key,omitempty"`       // content-hash for STORE / FIND_VALUE
-	Value     []byte     `json:"value,omitempty"`
-	Nodes     []DHTNode  `json:"nodes,omitempty"`
-	Providers []string   `json:"providers,omitempty"`
-	Error     string     `json:"error,omitempty"`
+	Type      string    `json:"type"`                // mirrors dht.Message.Type
+	FromID    string    `json:"from_id"`             // sending peer's node ID
+	FromIP    string    `json:"from_ip,omitempty"`   // sending peer's listener IP
+	FromPort  int       `json:"from_port,omitempty"` // sending peer's listener Port
+	TargetID  string    `json:"target_id,omitempty"` // for FIND_NODE / FIND_VALUE
+	Key       string    `json:"key,omitempty"`       // content-hash for STORE / FIND_VALUE
+	Value     []byte    `json:"value,omitempty"`
+	Nodes     []DHTNode `json:"nodes,omitempty"`
+	Providers []string  `json:"providers,omitempty"`
+	Error     string    `json:"error,omitempty"`
 }
 
 func MarshalDHTMessage(msg *DHTMessageBody) ([]byte, error) {

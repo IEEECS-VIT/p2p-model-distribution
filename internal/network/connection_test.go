@@ -185,4 +185,3 @@ func TestConnection_RPCRoundtrip(t *testing.T) {
 		t.Errorf("chunk response data mismatch: index=%d, success=%v, data=%s", chunkResp.ChunkIndex, chunkResp.Success, string(chunkResp.Data))
 	}
 }
-

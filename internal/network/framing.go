@@ -8,12 +8,12 @@ import (
 
 // MaxMessageSize prevents malicious peers from crashing the server with OOM attacks.
 // Let's set it to 10MB for now (adjust based on your AI model chunk sizes).
-const MaxMessageSize = 10 * 1024 * 1024 
+const MaxMessageSize = 10 * 1024 * 1024
 
 func WriteFrame(w io.Writer, data []byte) error {
 	// Optional: You could allocate a single buffer to do exactly 1 syscall,
 	// but writing twice is usually fine as long as the caller holds a Mutex!
-	
+
 	header := make([]byte, 4)
 	binary.BigEndian.PutUint32(header, uint32(len(data)))
 

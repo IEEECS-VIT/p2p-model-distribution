@@ -44,7 +44,7 @@ type Connection struct {
 	// at the exact same time without a mutex, their bytes might
 	// interleave (e.g., A_half, B_full, A_rest), permanently
 	// corrupting the stream for the receiver.
-	mu   sync.Mutex
+	mu sync.Mutex
 
 	// peerID is the logical identifier of the remote node.
 	// In a real P2P system, this is populated during a cryptographic
@@ -332,5 +332,3 @@ func generateUUID() string {
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
-
-

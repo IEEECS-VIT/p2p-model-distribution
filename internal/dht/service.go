@@ -313,8 +313,6 @@ func (s *Service) QueryNodeAddress(ctx context.Context, targetID string) (string
 	return "", false
 }
 
-
-
 // GetConnection returns (or creates) a connection to a peer by address.
 func (s *Service) GetConnection(addr string) (*network.Connection, error) {
 	// Fast path: check existing connections.
@@ -381,7 +379,6 @@ func (s *Service) sendDHTRequest(ctx context.Context, conn *network.Connection, 
 
 	return resp, nil
 }
-
 
 //---------------------------------------------------------------------
 // Internal

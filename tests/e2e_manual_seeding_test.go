@@ -82,8 +82,8 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 		}
 
 		resp := &protocol.GetMetadataResponse{
-			FileId:        req.FileId,
-			Success:       true,
+			FileId:       req.FileId,
+			Success:      true,
 			MetadataJson: manifestBytes,
 		}
 		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
@@ -221,7 +221,7 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 
 	// Step D: Reassemble the chunks into the final destination file
 	assembledPath := filepath.Join(downloaderDir, downloadedMeta.FileName)
-	
+
 	// Convert downloaderStore paths into slice of ChunkMeta
 	if err := filemeta.AssembleChunks(
 		downloaderStore.Layout().ChunksDir(fileID),
@@ -280,7 +280,7 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 	}
 
 	seederSvc := dht.NewService("seeder-node", "127.0.0.1:0", "", []string{bootstrapAddr})
-	
+
 	// Register file transfer handlers on seeder DHT router
 	seederRouter := seederSvc.Router()
 	seederRouter.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {

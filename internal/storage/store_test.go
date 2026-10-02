@@ -87,7 +87,7 @@ func TestDefaultChunkSizeFallback(t *testing.T) {
 	srcPath := filepath.Join(tempDir, "sample.bin")
 
 	// Create 2.5MB file data
-	data := make([]byte, 2*1024*1024 + 512*1024)
+	data := make([]byte, 2*1024*1024+512*1024)
 	if err := os.WriteFile(srcPath, data, 0644); err != nil {
 		t.Fatalf("failed to write sample file: %v", err)
 	}

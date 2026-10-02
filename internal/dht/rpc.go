@@ -7,4 +7,3 @@ const (
 	MsgFindValue = "FIND_VALUE"
 	MsgStore     = "STORE"
 )
-

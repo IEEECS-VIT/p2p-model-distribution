@@ -56,7 +56,7 @@ func (d *DHT) RecordProvider(chunkHash string, providerID string) {
 	d.Providers.Add(chunkHash, providerID)
 }
 
-//ProvidersFor returns the provider IDs known locally for a chunk hash.
+// ProvidersFor returns the provider IDs known locally for a chunk hash.
 func (d *DHT) ProvidersFor(chunkHash string) []string {
 	if d == nil {
 		return nil
@@ -68,7 +68,7 @@ func (d *DHT) ProvidersFor(chunkHash string) []string {
 	return d.Providers.Get(chunkHash)
 }
 
-//ClosestPeers returns the nearest known peers to a target ID.
+// ClosestPeers returns the nearest known peers to a target ID.
 func (d *DHT) ClosestPeers(targetID string, count int) []Node {
 	if d == nil || d.RoutingTable == nil {
 		return nil
