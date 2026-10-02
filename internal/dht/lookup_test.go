@@ -19,8 +19,7 @@ func startService(t *testing.T, bootstrap ...string) *Service {
 	}
 	t.Cleanup(s.Stop)
 	if len(bootstrap) > 0 {
-		s.bootstrap = bootstrap
-		s.bootstrapOnce()
+		s.bootstrapFrom(bootstrap)
 	}
 	return s
 }
@@ -120,5 +119,39 @@ func TestService_InboundPeersNeedVerifiedAddress(t *testing.T) {
 	}
 	if _, ok := s.table.FindNode(liar.ID()); ok {
 		t.Fatal("peer with an unreachable advertised address entered the routing table")
+	}
+}
+
+// TestService_RetriesBootstrapUntilReachable starts a node whose bootstrap
+// peer is not up yet; it must keep retrying and join once the peer starts.
+func TestService_RetriesBootstrapUntilReachable(t *testing.T) {
+	// Reserve an address for the bootstrap node, then free it.
+	bootID := newTestIdentity(t)
+	probe := network.NewServer("127.0.0.1:0", bootID.ServerTLSConfig())
+	if err := probe.Start(); err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	probe.Stop()
+
+	joiner := NewService(newTestIdentity(t), "127.0.0.1:0", "", []string{addr})
+	if err := joiner.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer joiner.Stop()
+
+	time.Sleep(300 * time.Millisecond) // first attempt fails
+	boot := NewService(bootID, addr, "", nil)
+	if err := boot.Start(); err != nil {
+		t.Fatalf("start bootstrap node: %v", err)
+	}
+	defer boot.Stop()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for joiner.RoutingTableSize() == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if joiner.RoutingTableSize() == 0 {
+		t.Fatal("node never joined after the bootstrap peer came up")
 	}
 }

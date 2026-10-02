@@ -2,6 +2,8 @@ package dht
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
@@ -109,9 +111,7 @@ func (s *Service) Start() error {
 	log.Printf("[DHT] Node %s listening on %s (advertised: %s:%d)",
 		s.self.ID, s.listen, s.self.IP, s.self.Port)
 
-	if len(s.bootstrap) > 0 {
-		go s.bootstrapLoop(ctx)
-	}
+	go s.maintain(ctx)
 
 	return nil
 }
@@ -390,26 +390,69 @@ func (s *Service) verifyInbound(node Node) {
 	}()
 }
 
-// bootstrapLoop periodically connects to bootstrap peers to stay
-// connected to the DHT network.
-func (s *Service) bootstrapLoop(ctx context.Context) {
-	ticker := time.NewTicker(60 * time.Second)
+// refreshInterval is how often the routing table is refreshed and expired
+// provider records are swept. Var so tests can shrink it.
+var refreshInterval = 10 * time.Minute
+
+// maxBootstrapBackoff caps the delay between failed join attempts.
+const maxBootstrapBackoff = time.Minute
+
+// maintain joins the network through the bootstrap peers (retrying with
+// exponential backoff until the routing table is non-empty), then
+// periodically refreshes the routing table and sweeps expired provider
+// records. If the table ever empties, it re-joins through the bootstrap
+// peers.
+func (s *Service) maintain(ctx context.Context) {
+	backoff := time.Second
+	for len(s.bootstrap) > 0 && s.table.Size() == 0 {
+		s.bootstrapFrom(s.bootstrap)
+		if s.table.Size() > 0 {
+			break
+		}
+		log.Printf("[DHT] could not join the network; retrying in %v", backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > maxBootstrapBackoff {
+			backoff = maxBootstrapBackoff
+		}
+	}
+
+	ticker := time.NewTicker(refreshInterval)
 	defer ticker.Stop()
-
-	s.bootstrapOnce()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.bootstrapOnce()
 		}
+
+		s.store.Sweep()
+		if s.table.Size() == 0 {
+			s.bootstrapFrom(s.bootstrap)
+			continue
+		}
+		// Refresh: a self-lookup keeps our neighbourhood current, and a
+		// lookup for a random ID refreshes distant buckets.
+		lookupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		s.lookup(lookupCtx, s.self.ID, false, 0)
+		s.lookup(lookupCtx, randomID(), false, 0)
+		cancel()
 	}
 }
 
-func (s *Service) bootstrapOnce() {
-	for _, addr := range s.bootstrap {
+// RoutingTableSize returns the number of verified peers in the routing
+// table.
+func (s *Service) RoutingTableSize() int {
+	return s.table.Size()
+}
+
+// bootstrapFrom contacts each address in addrs and then looks up our own
+// ID to populate the routing table.
+func (s *Service) bootstrapFrom(addrs []string) {
+	for _, addr := range addrs {
 		conn, err := s.pool.connectAddr(context.Background(), addr)
 		if err != nil {
 			log.Printf("[DHT] bootstrap dial %s: %v", addr, err)
@@ -437,6 +480,12 @@ func (s *Service) bootstrapOnce() {
 
 //---------------------------------------------------------------------
 // Helpers
+
+func randomID() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
 // nodeFromWire converts and validates a peer received from the network.
 func nodeFromWire(p *protocol.DHTPeer) (Node, bool) {
