@@ -3,7 +3,11 @@ package network
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,79 +15,147 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestConnection_FramingAndLifecycle(t *testing.T) {
-	// Start server on an ephemeral port
-	server := NewServer("127.0.0.1:0")
-
-	messageChan := make(chan []byte, 10)
-
-	server.OnNewConnection = func(conn *Connection) {
-		conn.Start()
-		for msg := range conn.Incoming {
-			messageChan <- msg
-			// Echo it back
-			_ = conn.WriteMessage(msg)
+func TestFraming_RoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	msgs := [][]byte{[]byte("hello p2p world"), {}, bytes.Repeat([]byte{7}, 70000)}
+	for _, m := range msgs {
+		if err := WriteFrame(&buf, m); err != nil {
+			t.Fatalf("WriteFrame: %v", err)
 		}
 	}
+	for i, want := range msgs {
+		got, err := ReadFrame(&buf)
+		if err != nil {
+			t.Fatalf("ReadFrame %d: %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("frame %d mismatch", i)
+		}
+	}
+}
 
+func TestFraming_RejectsOversizedFrames(t *testing.T) {
+	if err := WriteFrame(io.Discard, make([]byte, MaxMessageSize+1)); err == nil {
+		t.Fatal("WriteFrame accepted an oversized frame")
+	}
+
+	header := []byte{0xFF, 0xFF, 0xFF, 0xFF}
+	if _, err := ReadFrame(bytes.NewReader(header)); err == nil {
+		t.Fatal("ReadFrame accepted an oversized length header")
+	}
+}
+
+// startRawPeer returns a server-side Connection (with router) and the raw
+// client TLS socket talking to it, so tests can inject arbitrary frames.
+func startRawPeer(t *testing.T, router *Router) (*Connection, net.Conn) {
+	t.Helper()
+	server, _ := newTestServer(t)
+	accepted := make(chan *Connection, 1)
+	server.OnNewConnection = func(conn *Connection) {
+		conn.SetRouter(router)
+		conn.Start()
+		accepted <- conn
+	}
 	if err := server.Start(); err != nil {
 		t.Fatalf("failed to start server: %v", err)
 	}
-	defer server.Stop()
+	t.Cleanup(server.Stop)
 
-	// Get listener address to connect to
-	addr := server.listener.Addr().String()
+	raw := dialRawTLS(t, server.Addr().String())
 
-	// Connect client
-	rawConn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-
-	clientConn := NewConnection(rawConn, "client-1")
-	clientConn.Start()
-
-	// Send message
-	testMsg := []byte("hello p2p world")
-	if err := clientConn.WriteMessage(testMsg); err != nil {
-		t.Fatalf("failed to write message: %v", err)
-	}
-
-	// Verify server received the message
 	select {
-	case recMsg := <-messageChan:
-		if !bytes.Equal(recMsg, testMsg) {
-			t.Errorf("expected %q, got %q", testMsg, recMsg)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("timeout waiting for server to receive message")
+	case c := <-accepted:
+		return c, raw
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not accept connection")
+		return nil, nil
+	}
+}
+
+func TestConnection_MalformedFrameClosesConnection(t *testing.T) {
+	conn, raw := startRawPeer(t, NewRouter())
+
+	// 0xFF is never a valid protobuf field tag, so this cannot parse.
+	if err := WriteFrame(raw, []byte{0xFF, 0xFF, 0xFF}); err != nil {
+		t.Fatal(err)
 	}
 
-	// Verify client received the echo
 	select {
-	case echoMsg := <-clientConn.Incoming:
-		if !bytes.Equal(echoMsg, testMsg) {
-			t.Errorf("expected %q, got %q", testMsg, echoMsg)
+	case <-conn.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection stayed open after a malformed frame")
+	}
+}
+
+// TestConnection_DuplicateResponsesDoNotWedgeReadLoop reproduces a peer
+// answering one request many times. Previously every duplicate was pushed
+// into the request's 1-slot channel, so the third one blocked the read
+// loop forever and the connection stopped processing all traffic.
+func TestConnection_DuplicateResponsesDoNotWedgeReadLoop(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+
+	client := NewConnection(clientSide, "server")
+	client.Start()
+	defer client.Close()
+
+	// Fake server: answer the first request 10 times, then answer the
+	// second request normally.
+	go func() {
+		for i := 0; i < 2; i++ {
+			data, err := ReadFrame(serverSide)
+			if err != nil {
+				return
+			}
+			var req protocol.Envelope
+			_ = proto.Unmarshal(data, &req)
+			resp, _ := proto.Marshal(&protocol.Envelope{Id: req.Id, Type: protocol.MessageType_MSG_GET_CHUNK_RESPONSE, IsResponse: true})
+			repeats := 1
+			if i == 0 {
+				repeats = 10
+			}
+			for j := 0; j < repeats; j++ {
+				if err := WriteFrame(serverSide, resp); err != nil {
+					return
+				}
+			}
 		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("timeout waiting for client to receive echo")
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := 0; i < 2; i++ {
+		if _, err := client.SendRaw(ctx, protocol.MessageType_MSG_GET_CHUNK_REQUEST, nil); err != nil {
+			t.Fatalf("request %d failed: %v", i, err)
+		}
+	}
+}
+
+func TestConnection_PendingRequestsFailWhenConnectionCloses(t *testing.T) {
+	serverSide, clientSide := net.Pipe()
+	client := NewConnection(clientSide, "server")
+	client.Start()
+
+	go func() {
+		_, _ = ReadFrame(serverSide) // swallow the request, then hang up
+		serverSide.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := client.SendRaw(ctx, protocol.MessageType_MSG_GET_CHUNK_REQUEST, nil); err == nil || ctx.Err() != nil {
+		t.Fatalf("SendRaw err = %v, want prompt connection-closed error", err)
 	}
 
-	// Close client connection and verify incoming channel closes
-	clientConn.Close()
-	select {
-	case _, ok := <-clientConn.Incoming:
-		if ok {
-			t.Error("expected Incoming channel to be closed")
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("timeout waiting for client Incoming channel to close")
+	<-client.Done()
+	if _, err := client.SendRaw(ctx, protocol.MessageType_MSG_GET_CHUNK_REQUEST, nil); err == nil {
+		t.Fatal("SendRaw on a closed connection succeeded")
 	}
 }
 
 func TestConnection_RPCRoundtrip(t *testing.T) {
 	// Start server on an ephemeral port
-	server := NewServer("127.0.0.1:0")
+	server, _ := newTestServer(t)
 
 	// Set up router on server side
 	router := NewRouter()
@@ -126,14 +198,7 @@ func TestConnection_RPCRoundtrip(t *testing.T) {
 	defer server.Stop()
 
 	// Connect client
-	addr := server.listener.Addr().String()
-	rawConn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer rawConn.Close()
-
-	clientConn := NewConnection(rawConn, "client-node")
+	clientConn := dialTest(t, server.Addr().String())
 	clientConn.Start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -186,3 +251,71 @@ func TestConnection_RPCRoundtrip(t *testing.T) {
 	}
 }
 
+func TestRouter_UnknownTypeGetsErrorResponse(t *testing.T) {
+	_, raw := startRawPeer(t, NewRouter())
+	client := NewConnection(raw, "server")
+	client.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := client.SendRaw(ctx, protocol.MessageType(999), nil)
+	var remote *RemoteError
+	if !errors.As(err, &remote) {
+		t.Fatalf("SendRaw err = %v, want *RemoteError before the timeout", err)
+	}
+}
+
+func TestRouter_HandlerErrorsAreNotLeaked(t *testing.T) {
+	router := NewRouter()
+	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(*Connection, *protocol.Envelope) error {
+		return fmt.Errorf("open /secret/path/0.chunk: permission denied")
+	})
+	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(*Connection, *protocol.Envelope) error {
+		return fmt.Errorf("%w: unknown file", ErrBadRequest)
+	})
+	_, raw := startRawPeer(t, router)
+	client := NewConnection(raw, "server")
+	client.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := client.SendRaw(ctx, protocol.MessageType_MSG_GET_CHUNK_REQUEST, nil)
+	var remote *RemoteError
+	if !errors.As(err, &remote) || strings.Contains(remote.Message, "secret") {
+		t.Fatalf("internal error leaked or missing: %v", err)
+	}
+
+	_, err = client.SendRaw(ctx, protocol.MessageType_MSG_GET_METADATA_REQUEST, nil)
+	if !errors.As(err, &remote) || !strings.Contains(remote.Message, "unknown file") {
+		t.Fatalf("bad-request message not propagated: %v", err)
+	}
+}
+
+// TestConnection_UnsolicitedResponsesAreIgnored checks that responses are
+// never routed: otherwise an unsolicited response would trigger an error
+// reply, which the peer would answer with another error, and so on.
+func TestConnection_UnsolicitedResponsesAreIgnored(t *testing.T) {
+	called := make(chan struct{}, 1)
+	router := NewRouter()
+	router.Register(protocol.MessageType_MSG_GET_CHUNK_RESPONSE, func(*Connection, *protocol.Envelope) error {
+		called <- struct{}{}
+		return nil
+	})
+	_, raw := startRawPeer(t, router)
+
+	resp, _ := proto.Marshal(&protocol.Envelope{Id: "nobody-asked", Type: protocol.MessageType_MSG_GET_CHUNK_RESPONSE, IsResponse: true})
+	if err := WriteFrame(raw, resp); err != nil {
+		t.Fatal(err)
+	}
+
+	raw.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := ReadFrame(raw); err == nil {
+		t.Fatal("peer replied to an unsolicited response")
+	}
+	select {
+	case <-called:
+		t.Fatal("response was routed to a handler")
+	default:
+	}
+}

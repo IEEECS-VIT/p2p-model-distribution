@@ -2,8 +2,8 @@ package storage
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 
@@ -11,14 +11,9 @@ import (
 )
 
 // Store handles the file system storage layout, writes chunk files,
-// and saves/loads manifests and state files.
+// and saves/loads manifests.
 type Store struct {
 	layout *Layout
-}
-
-// ChunkStore stores chunks in a CID-scoped layout.
-type ChunkStore struct {
-	BaseDir string
 }
 
 // NewStore creates a new Store instance with the given base directory.
@@ -26,15 +21,6 @@ func NewStore(baseDir string) *Store {
 	return &Store{
 		layout: NewLayout(baseDir),
 	}
-}
-
-// NewChunkStore creates a ChunkStore instance with the given base directory.
-func NewChunkStore(baseDir string) (*ChunkStore, error) {
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return nil, err
-	}
-
-	return &ChunkStore{BaseDir: baseDir}, nil
 }
 
 // Layout returns the underlying storage layout configuration.
@@ -68,16 +54,9 @@ func (s *Store) SaveManifest(meta filemeta.FileMeta) error {
 		return fmt.Errorf("marshal manifest: %w", err)
 	}
 
-	// Write atomically using a temporary file
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return fmt.Errorf("write tmp manifest: %w", err)
+	if err := writeFileAtomic(path, data); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename manifest: %w", err)
-	}
-
 	return nil
 }
 
@@ -107,17 +86,13 @@ func (s *Store) WriteChunk(fileID string, index int, data []byte) error {
 		return err
 	}
 
-	chunkPath := filepath.Join(s.layout.ChunksDir(fileID), fmt.Sprintf("%d.chunk", index))
-	tmpPath := chunkPath + ".tmp"
-
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return fmt.Errorf("write tmp chunk %d: %w", index, err)
+	if index < 0 {
+		return fmt.Errorf("write chunk: negative index %d", index)
 	}
-	if err := os.Rename(tmpPath, chunkPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename chunk %d: %w", index, err)
+	chunkPath := filepath.Join(s.layout.ChunksDir(fileID), chunkFileName(index))
+	if err := writeFileAtomic(chunkPath, data); err != nil {
+		return fmt.Errorf("write chunk %d: %w", index, err)
 	}
-
 	return nil
 }
 
@@ -127,104 +102,135 @@ func (s *Store) ReadChunk(fileID string, index int) ([]byte, error) {
 		return nil, fmt.Errorf("read chunk for %q: %w", fileID, ErrInvalidFileID)
 	}
 
-	chunkPath := filepath.Join(s.layout.ChunksDir(fileID), fmt.Sprintf("%d.chunk", index))
+	if index < 0 {
+		return nil, fmt.Errorf("read chunk: negative index %d", index)
+	}
+	chunkPath := filepath.Join(s.layout.ChunksDir(fileID), chunkFileName(index))
 	return os.ReadFile(chunkPath)
 }
 
-// ReadChunk reads a chunk from a CID-scoped chunk store.
-func (s *ChunkStore) ReadChunk(cid string, index int) ([]byte, error) {
-	path := filepath.Join(s.BaseDir, cid, fmt.Sprintf("%d.chunk", index))
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read chunk %s/%d: %w", cid, index, err)
-	}
-	return data, nil
-}
-
-// WriteChunk writes a chunk to a CID-scoped chunk store.
-func (s *ChunkStore) WriteChunk(cid string, index int, data []byte) error {
-	dir := filepath.Join(s.BaseDir, cid)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	path := filepath.Join(dir, fmt.Sprintf("%d.chunk", index))
-	tmpPath := path + ".tmp"
-
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return fmt.Errorf("write tmp chunk %d: %w", index, err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename chunk %d: %w", index, err)
-	}
-
-	return nil
-}
-
-// WriteChunksFromReader splits a stream into chunk files and stores them directly to disk.
-func (s *Store) WriteChunksFromReader(src io.Reader, fileID string, chunkSize int) error {
-	if chunkSize <= 0 {
-		chunkSize = filemeta.DefaultChunkSize
-	}
-	if err := s.InitializeFileDirectories(fileID); err != nil {
-		return err
-	}
-
-	buf := make([]byte, chunkSize)
-	index := 0
-
-	for {
-		n, readErr := io.ReadFull(src, buf)
-		if n == 0 {
-			break
-		}
-		if readErr != nil && readErr != io.ErrUnexpectedEOF {
-			return fmt.Errorf("read chunk %d: %w", index, readErr)
-		}
-
-		if err := s.WriteChunk(fileID, index, buf[:n]); err != nil {
-			return err
-		}
-		index++
-
-		if readErr == io.ErrUnexpectedEOF {
-			break
-		}
-	}
-
-	return nil
-}
-
-// StoreModel takes a source file path and chunks it, saves chunks and the manifest.
-func (s *Store) StoreModel(srcPath string, fileID string, chunkSize int) (filemeta.FileMeta, string, error) {
+// StoreModel chunks the file at srcPath into the store and saves its
+// manifest. Since the file ID is the manifest CID, which is only known once
+// the whole file has been read, chunks are first written to a staging
+// directory and moved into place once the CID is known.
+func (s *Store) StoreModel(srcPath string, chunkSize int) (filemeta.FileMeta, error) {
 	f, err := os.Open(srcPath)
 	if err != nil {
-		return filemeta.FileMeta{}, "", err
+		return filemeta.FileMeta{}, err
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return filemeta.FileMeta{}, "", err
+		return filemeta.FileMeta{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return filemeta.FileMeta{}, fmt.Errorf("%s is not a regular file", srcPath)
+	}
+	name := filepath.Base(srcPath)
+	if err := filemeta.ValidateFileName(name); err != nil {
+		return filemeta.FileMeta{}, err
 	}
 
-	// Build the manifest while writing chunk files in a single streaming pass.
-	if err := s.InitializeFileDirectories(fileID); err != nil {
-		return filemeta.FileMeta{}, "", err
+	stagingRoot := filepath.Join(s.layout.BaseDir(), stagingDirName)
+	if err := os.MkdirAll(stagingRoot, 0o755); err != nil {
+		return filemeta.FileMeta{}, fmt.Errorf("create staging dir: %w", err)
+	}
+	staging, err := os.MkdirTemp(stagingRoot, "import-")
+	if err != nil {
+		return filemeta.FileMeta{}, fmt.Errorf("create staging dir: %w", err)
+	}
+	defer os.RemoveAll(staging)
+
+	stagingChunks := filepath.Join(staging, "chunks")
+	if err := os.Mkdir(stagingChunks, 0o755); err != nil {
+		return filemeta.FileMeta{}, fmt.Errorf("create staging chunks dir: %w", err)
 	}
 
-	meta, cid, err := filemeta.BuildManifestWithChunkWriter(f, fileID, filepath.Base(srcPath), info.Size(), chunkSize, func(index int, data []byte) error {
-		return s.WriteChunk(fileID, index, data)
+	meta, cid, err := filemeta.BuildManifestWithChunkWriter(f, name, info.Size(), chunkSize, func(index int, data []byte) error {
+		return writeFileAtomic(filepath.Join(stagingChunks, chunkFileName(index)), data)
 	})
 	if err != nil {
-		return filemeta.FileMeta{}, "", err
+		return filemeta.FileMeta{}, err
 	}
 
-	// Save the manifest JSON to disk
+	if s.HasCompleteFile(cid) {
+		// Identical content is already stored; nothing to do.
+		return meta, nil
+	}
+
+	// Discard any partial state for this ID (e.g. an interrupted
+	// download) and move the freshly written chunks into place.
+	if err := os.RemoveAll(s.layout.FileDir(cid)); err != nil {
+		return filemeta.FileMeta{}, fmt.Errorf("clear existing file dir: %w", err)
+	}
+	if err := os.Rename(staging, s.layout.FileDir(cid)); err != nil {
+		return filemeta.FileMeta{}, fmt.Errorf("move staged chunks into place: %w", err)
+	}
+
+	// The manifest is written last: its presence marks the file complete.
 	if err := s.SaveManifest(meta); err != nil {
-		return filemeta.FileMeta{}, "", err
+		return filemeta.FileMeta{}, err
 	}
 
-	return meta, cid, nil
+	return meta, nil
+}
+
+// HasCompleteFile reports whether a manifest whose CID matches fileID is
+// stored. Manifests are only written once every chunk is on disk, so this
+// is the marker for a complete file.
+func (s *Store) HasCompleteFile(fileID string) bool {
+	meta, err := s.LoadManifest(fileID)
+	if err != nil {
+		return false
+	}
+	return meta.VerifyID(fileID) == nil
+}
+
+// CompleteFiles returns the IDs of every complete file in the store.
+// Partial downloads, the staging area and anything else in the base
+// directory are skipped.
+func (s *Store) CompleteFiles() ([]string, error) {
+	entries, err := os.ReadDir(s.layout.BaseDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() && ValidFileID(e.Name()) && s.HasCompleteFile(e.Name()) {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids, nil
+}
+
+// writeFileAtomic writes data to path via a synced temporary file and a
+// rename, so readers never observe a partially written file.
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op once renamed
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func chunkFileName(index int) string {
+	return fmt.Sprintf("%d.chunk", index)
 }

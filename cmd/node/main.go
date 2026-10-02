@@ -1,507 +1,207 @@
+// Command node runs a peer of the P2P model distribution network.
+//
+// Every node joins the DHT, serves the complete files in its data
+// directory, and announces them so other peers can find them.
+//
+//	node -seed model.bin                      import a file and seed it
+//	node -bootstrap 1.2.3.4:9000              serve stored files
+//	node -bootstrap 1.2.3.4:9000 -download ID download a file, then keep seeding it
 package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/IEEECS-VIT/p2p-model-distribution/internal/dht"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/downloader"
-	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
-	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
-	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
-	"google.golang.org/protobuf/proto"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/node"
 )
 
-// ANSI terminal color codes
-const (
-	colorReset  = "\033[0m"
-	colorBold   = "\033[1m"
-	colorGreen  = "\033[32m"
-	colorCyan   = "\033[36m"
-	colorBlue   = "\033[34m"
-	colorYellow = "\033[33m"
-	colorRed    = "\033[31m"
-)
+type options struct {
+	dataDir           string
+	listen            string
+	external          string
+	bootstrap         []string
+	seedFile          string
+	chunkSizeKB       int
+	downloadID        string
+	peers             []string
+	outPath           string
+	exitAfterDownload bool
+	timeout           time.Duration
+	logLevel          slog.Level
+}
 
 func main() {
-	mode := flag.String("mode", "seed", "running mode: 'seed' or 'download'")
-	port := flag.String("port", "9000", "port to listen on")
-	file := flag.String("file", "", "path to the file to seed")
-	dataDir := flag.String("data", "./node-data", "directory where chunks and metadata are stored")
-	chunkSizeKB := flag.Int("chunk-kb", 1024, "chunk size in KB (default 1024KB / 1MB)")
-
-	// Download params (legacy, non-DHT)
-	addr := flag.String("addr", "", "target seeder address to dial (e.g. 127.0.0.1:9000)")
-	fileID := flag.String("file-id", "", "the unique File ID of the manifest to download")
-	outPath := flag.String("out", "", "destination path for the reassembled file")
-
-	// DHT flags
-	dhtEnable := flag.Bool("dht", false, "enable DHT peer discovery")
-	dhtBootstrap := flag.String("dht-bootstrap", "", "comma-separated bootstrap peer addresses (ip:port)")
-	dhtNodeID := flag.String("dht-node-id", "", "node ID (random if empty)")
-	dhtExternal := flag.String("dht-external", "", "external address advertised to peers (ip:port)")
-
-	flag.Parse()
-
-	printHeader()
-
-	if *dhtEnable {
-		runWithDHT(*mode, *port, *file, *dataDir, *chunkSizeKB*1024,
-			*addr, *fileID, *outPath, *dhtNodeID, *dhtExternal, *dhtBootstrap)
-	} else {
-		runLegacy(*mode, *port, *file, *dataDir, *chunkSizeKB*1024,
-			*addr, *fileID, *outPath)
-	}
-}
-
-//---------------------------------------------------------------------
-// Legacy (non-DHT) mode — original behaviour.
-
-func runLegacy(mode, port, filePath, dataDir string, chunkSize int, addr, fileID, outPath string) {
-	if mode == "seed" {
-		runSeeder(port, filePath, dataDir, chunkSize)
-	} else if mode == "download" {
-		if addr == "" || fileID == "" {
-			fmt.Printf("%s[ERROR]%s -addr and -file-id are required for download mode\n", colorRed, colorReset)
-			flag.Usage()
-			os.Exit(1)
+	opts, err := parseFlags(os.Args[1:])
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
 		}
-		runDownloader(addr, fileID, dataDir, outPath)
-	} else {
-		fmt.Printf("%s[ERROR]%s invalid mode '%s'. Choose 'seed' or 'download'\n", colorRed, colorReset, mode)
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(2)
+	}
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: opts.logLevel})))
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, opts); err != nil {
+		ui.errorf("%v", err)
 		os.Exit(1)
 	}
 }
 
-//---------------------------------------------------------------------
-// DHT-enabled mode.
+func parseFlags(args []string) (options, error) {
+	var o options
+	var bootstrap, peers, logLevel string
 
-func runWithDHT(mode, port, filePath, dataDir string, chunkSize int,
-	addr, fileID, outPath, nodeID, external, bootstrapCSV string) {
-
-	listenAddr := "0.0.0.0:" + port
-	var seeds []string
-	if bootstrapCSV != "" {
-		for _, s := range strings.Split(bootstrapCSV, ",") {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				seeds = append(seeds, s)
-			}
-		}
+	fs := flag.NewFlagSet("node", flag.ContinueOnError)
+	fs.StringVar(&o.dataDir, "data", "./node-data", "directory for the node key, chunks and manifests")
+	fs.StringVar(&o.listen, "listen", ":9000", "address to accept peer connections on")
+	fs.StringVar(&o.external, "external", "", "address advertised to peers (ip:port), if different from the listen address")
+	fs.StringVar(&bootstrap, "bootstrap", "", "comma-separated bootstrap peer addresses (ip:port)")
+	fs.StringVar(&o.seedFile, "seed", "", "import this file into the data directory and seed it")
+	fs.IntVar(&o.chunkSizeKB, "chunk-kb", 1024, "chunk size in KiB for -seed (1 to 8192)")
+	fs.StringVar(&o.downloadID, "download", "", "file ID to download")
+	fs.StringVar(&peers, "peer", "", "comma-separated provider addresses to download from directly, in addition to the DHT")
+	fs.StringVar(&o.outPath, "out", "", "destination for the downloaded file (default: OS temp dir)")
+	fs.BoolVar(&o.exitAfterDownload, "exit-after-download", false, "exit after downloading instead of seeding the file")
+	fs.DurationVar(&o.timeout, "timeout", 0, "give up on the download after this long (0 = no limit)")
+	fs.StringVar(&logLevel, "log-level", "info", "log level: debug, info, warn or error")
+	if err := fs.Parse(args); err != nil {
+		return o, err
+	}
+	if fs.NArg() > 0 {
+		return o, fmt.Errorf("unexpected arguments: %v", fs.Args())
 	}
 
-	// Create the DHT service.
-	svc := dht.NewService(nodeID, listenAddr, external, seeds)
-	store := storage.NewStore(dataDir)
-
-	// Register file-transfer handlers on the DHT service's router.
-	registerFileHandlers(svc.Router(), store)
-
-	// Start the DHT service (TCP listener + bootstrap).
-	if err := svc.Start(); err != nil {
-		log.Fatalf("failed to start DHT service: %v", err)
+	o.bootstrap = splitList(bootstrap)
+	o.peers = splitList(peers)
+	if err := o.logLevel.UnmarshalText([]byte(logLevel)); err != nil {
+		return o, fmt.Errorf("invalid -log-level %q", logLevel)
 	}
+	if o.chunkSizeKB < 1 || o.chunkSizeKB > 8192 {
+		return o, fmt.Errorf("-chunk-kb must be between 1 and 8192, got %d", o.chunkSizeKB)
+	}
+	if o.downloadID == "" && (o.outPath != "" || len(o.peers) > 0 || o.exitAfterDownload || o.timeout != 0) {
+		return o, errors.New("-out, -peer, -exit-after-download and -timeout require -download")
+	}
+	if o.downloadID != "" && len(o.bootstrap) == 0 && len(o.peers) == 0 {
+		return o, errors.New("-download needs -bootstrap or -peer to find providers")
+	}
+	return o, nil
+}
 
-	self := svc.Self()
-	fmt.Printf("%s[DHT]%s Node ID: %s%s%s  (advertised: %s:%d)\n",
-		colorCyan, colorReset, colorBold, self.ID, colorReset, self.IP, self.Port)
+func run(ctx context.Context, o options) error {
+	ui.header()
 
-	// Clean shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-shutdown
-		cancel()
+	n, err := node.New(node.Config{
+		DataDir:      o.dataDir,
+		ListenAddr:   o.listen,
+		ExternalAddr: o.external,
+		Bootstrap:    o.bootstrap,
+	})
+	if err != nil {
+		return err
+	}
+	if err := n.Start(); err != nil {
+		return err
+	}
+	defer func() {
+		ui.infof("Stopping...")
+		n.Stop()
 	}()
 
-	if mode == "seed" {
-		runDHSeeder(ctx, filePath, dataDir, chunkSize, svc, store, len(seeds) > 0)
-		<-ctx.Done()
-	} else if mode == "download" {
-		runDHDownloader(ctx, fileID, outPath, dataDir, svc, store)
-		<-ctx.Done()
+	self := n.Self()
+	if o.external != "" {
+		ui.infof("Node ID %s, listening on %s (advertised as %s)", ui.bold(self.ID), o.listen, self.Endpoint())
 	} else {
-		fmt.Printf("%s[ERROR]%s invalid mode '%s'\n", colorRed, colorReset, mode)
-		svc.Stop()
-		os.Exit(1)
+		ui.infof("Node ID %s, listening on %s", ui.bold(self.ID), o.listen)
 	}
 
-	fmt.Printf("\n%s[SERVER]%s Stopping...\n", colorYellow, colorReset)
-	svc.Stop()
-	fmt.Printf("%s[SERVER]%s Stopped cleanly.\n", colorGreen, colorReset)
-}
+	if o.seedFile != "" {
+		ui.infof("Importing %s...", o.seedFile)
+		meta, err := n.AddFile(o.seedFile, o.chunkSizeKB*1024)
+		if err != nil {
+			return fmt.Errorf("import %s: %w", o.seedFile, err)
+		}
+		ui.successf("Seeding %s (%d chunks, %.2f MiB)", meta.FileName, meta.NumChunks, float64(meta.FileSize)/(1<<20))
+		ui.successf("File ID: %s", ui.bold(meta.FileID))
+	}
 
-func registerFileHandlers(router *network.Router, store *storage.Store) {
-	// Metadata handler
-	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetMetadataRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
+	if len(o.bootstrap) > 0 {
+		waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := n.WaitForPeers(waitCtx)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			ui.warnf("No bootstrap peer reachable yet; retrying in the background")
+		}
+	}
+
+	if o.downloadID != "" {
+		if err := download(ctx, n, o); err != nil {
 			return err
 		}
-		fmt.Printf("%s[RPC]%s Metadata Request for File ID: %s from %s\n",
-			colorYellow, colorReset, req.FileId, conn.RemoteAddr().String())
-
-		meta, err := store.LoadManifest(req.FileId)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   fmt.Sprintf("manifest not found: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
+		if o.exitAfterDownload {
+			return nil
 		}
-		manifestBytes, err := json.Marshal(meta)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   fmt.Sprintf("failed to marshal manifest: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-		resp := &protocol.GetMetadataResponse{
-			FileId:       req.FileId,
-			Success:      true,
-			MetadataJson: manifestBytes,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-	})
+	}
 
-	// Chunk handler
-	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetChunkRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-		chunkData, err := store.ReadChunk(req.FileId, int(req.ChunkIndex))
-		if err != nil {
-			resp := &protocol.GetChunkResponse{
-				FileId:     req.FileId,
-				ChunkIndex: req.ChunkIndex,
-				Success:    false,
-				Error:      fmt.Sprintf("chunk read failed: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-		}
-		resp := &protocol.GetChunkResponse{
-			FileId:     req.FileId,
-			ChunkIndex: req.ChunkIndex,
-			Success:    true,
-			Data:       chunkData,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-	})
-}
-
-//---------------------------------------------------------------------
-// DHT Seeder
-
-func runDHSeeder(ctx context.Context, filePath, dataDir string, chunkSize int, svc *dht.Service, store *storage.Store, hasBootstrap bool) {
-	fileID := ""
-
-	if filePath != "" {
-		info, err := os.Stat(filePath)
-		if err != nil {
-			log.Fatalf("failed to open source file: %v", err)
-		}
-
-		fileID = generateRandomID()
-		fmt.Printf("%s[SEEDER]%s Chunking %s%s%s (%.2f MB)...\n",
-			colorBlue, colorReset, colorBold, info.Name(), colorReset, float64(info.Size())/(1024*1024))
-
-		meta, cid, err := store.StoreModel(filePath, fileID, chunkSize)
-		if err != nil {
-			log.Fatalf("failed to split and seed model: %v", err)
-		}
-
-		fmt.Printf("%s[SEEDER]%s ✓ Chunks stored under: %s/%s/chunks\n", colorGreen, colorReset, dataDir, fileID)
-		fmt.Printf("%s[SEEDER]%s ✓ File ID: %s%s%s (Use this ID to download)\n", colorGreen, colorReset, colorBold, fileID, colorReset)
-		fmt.Printf("%s[SEEDER]%s ✓ Manifest CID: %s\n", colorGreen, colorReset, cid)
-
-		// Wait for at least one peer connection if we have bootstrap peers configured,
-		// so that the initial announcement doesn't go into a black hole.
-		if hasBootstrap {
-			fmt.Printf("%s[DHT]%s Waiting up to 10s for connection to bootstrap peers...\n", colorBlue, colorReset)
-			for i := 0; i < 10; i++ {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					if svc.ConnectedPeersCount() > 0 {
-						goto connected
-					}
-					time.Sleep(1 * time.Second)
-				}
-			}
-		}
-
-	connected:
-		// Announce file ID and each chunk hash in the DHT.
-		fmt.Printf("%s[DHT]%s Announcing file in DHT...\n", colorBlue, colorReset)
-		numPeers := svc.AnnounceProvider(fileID)
-		for _, c := range meta.Chunks {
-			svc.AnnounceProvider(c.CID)
-		}
-		fmt.Printf("%s[DHT]%s ✓ File announced to %d connected peers\n", colorGreen, colorReset, numPeers)
-
-		// Periodically re-announce in the background to handle node churn/re-joins
-		go func() {
-			ticker := time.NewTicker(30 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					svc.AnnounceProvider(fileID)
-					for _, c := range meta.Chunks {
-						svc.AnnounceProvider(c.CID)
-					}
-				case <-ctx.Done():
-					return
-				}
-			}
-		}()
+	if seeding := n.Seeding(); len(seeding) > 0 {
+		ui.infof("Serving %d file(s); press Ctrl-C to stop", len(seeding))
 	} else {
-		// Serving existing data: try to discover FileIDs from the data directory.
-		entries, err := os.ReadDir(dataDir)
-		var fileIDs []string
-		if err == nil {
-			for _, e := range entries {
-				if e.IsDir() {
-					fileIDs = append(fileIDs, e.Name())
-				}
-			}
-		}
-
-		if len(fileIDs) > 0 {
-			if hasBootstrap {
-				fmt.Printf("%s[DHT]%s Waiting up to 10s for connection to bootstrap peers...\n", colorBlue, colorReset)
-				for i := 0; i < 10; i++ {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						if svc.ConnectedPeersCount() > 0 {
-							goto existingConnected
-						}
-						time.Sleep(1 * time.Second)
-					}
-				}
-			}
-
-		existingConnected:
-			fmt.Printf("%s[DHT]%s Announcing %d existing files in DHT...\n", colorBlue, colorReset, len(fileIDs))
-			for _, fid := range fileIDs {
-				svc.AnnounceProvider(fid)
-			}
-
-			// Periodically re-announce in the background
-			go func() {
-				ticker := time.NewTicker(30 * time.Second)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-ticker.C:
-						for _, fid := range fileIDs {
-							svc.AnnounceProvider(fid)
-						}
-					case <-ctx.Done():
-						return
-					}
-				}
-			}()
-		}
-		fmt.Printf("%s[SEEDER]%s Serving existing data from: %s\n", colorBlue, colorReset, dataDir)
+		ui.infof("Serving as a DHT node; press Ctrl-C to stop")
 	}
-
-	fmt.Printf("%s[SERVER]%s TCP Server listening with DHT enabled...\n", colorGreen, colorReset)
+	<-ctx.Done()
+	return nil
 }
 
-//---------------------------------------------------------------------
-// DHT Downloader
-
-func runDHDownloader(ctx context.Context, fileID, outPath, dataDir string, svc *dht.Service, store *storage.Store) {
-	if fileID == "" {
-		log.Fatalf("-file-id is required for download mode")
+func download(ctx context.Context, n *node.Node, o options) error {
+	if o.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, o.timeout)
+		defer cancel()
 	}
 
-	fmt.Printf("%s[DHT]%s Looking up providers for File ID: %s%s%s...\n",
-		colorBlue, colorReset, colorBold, fileID, colorReset)
-
-	dlCtx, dlCancel := context.WithTimeout(ctx, 60*time.Second)
-	defer dlCancel()
-
-	// Query DHT network for providers, retrying up to 15 seconds to allow background bootstrap connection.
-	var providers []string
-	fmt.Printf("%s[DHT]%s Querying DHT network for provider endpoints...\n", colorBlue, colorReset)
-	for i := 0; i < 15; i++ {
-		select {
-		case <-dlCtx.Done():
-			log.Fatalf("download cancelled or timed out before discovery")
-		default:
-			providers = svc.FindProviders(dlCtx, fileID)
-			if len(providers) > 0 {
-				goto foundProviders
-			}
-			time.Sleep(1 * time.Second)
-		}
-	}
-
-foundProviders:
-	fmt.Printf("%s[DHT]%s Found %d initial provider(s)\n", colorGreen, colorReset, len(providers))
-
-	dl := downloader.New(fileID, dataDir, svc, store, providers, 4)
-	_, err := dl.Download(dlCtx, outPath)
+	ui.infof("Downloading %s...", ui.bold(o.downloadID))
+	start := time.Now()
+	meta, err := n.Download(ctx, o.downloadID, o.outPath, downloader.Options{
+		Providers: o.peers,
+		Progress:  ui.progress,
+	})
+	ui.endProgress()
 	if err != nil {
-		log.Fatalf("download failed: %v", err)
+		return fmt.Errorf("download failed: %w", err)
 	}
+
+	out := o.outPath
+	if out == "" {
+		out = filepath.Join(os.TempDir(), meta.FileName)
+	}
+	ui.successf("Downloaded and verified %s (%.2f MiB) in %v", meta.FileName, float64(meta.FileSize)/(1<<20), time.Since(start).Round(time.Millisecond))
+	ui.successf("Saved to %s", out)
+	if !o.exitAfterDownload {
+		ui.infof("Now seeding %s to other peers", meta.FileName)
+	}
+	return nil
 }
 
-//---------------------------------------------------------------------
-// Legacy seeder (no DHT)
-
-func runSeeder(port, filePath, dataDir string, chunkSize int) {
-	store := storage.NewStore(dataDir)
-
-	if filePath != "" {
-		info, err := os.Stat(filePath)
-		if err != nil {
-			log.Fatalf("failed to open source file: %v", err)
+func splitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
 		}
-		genFileID := generateRandomID()
-		fmt.Printf("%s[SEEDER]%s Chunking original file %s%s%s (%.2f MB)...\n",
-			colorBlue, colorReset, colorBold, info.Name(), colorReset, float64(info.Size())/(1024*1024))
-
-		_, _, err = store.StoreModel(filePath, genFileID, chunkSize)
-		if err != nil {
-			log.Fatalf("failed to split and seed model: %v", err)
-		}
-		fmt.Printf("%s[SEEDER]%s ✓ Chunks stored under: %s/%s/chunks\n", colorGreen, colorReset, dataDir, genFileID)
-		fmt.Printf("%s[SEEDER]%s ✓ File ID: %s%s%s (Use this ID to download)\n\n", colorGreen, colorReset, colorBold, genFileID, colorReset)
-	} else {
-		fmt.Printf("%s[SEEDER]%s Starting seeder from existing data directory: %s\n", colorBlue, colorReset, dataDir)
 	}
-
-	listenAddr := "0.0.0.0:" + port
-	server := network.NewServer(listenAddr)
-	router := network.NewRouter()
-
-	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetMetadataRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-		fmt.Printf("%s[RPC]%s Received Metadata Request for File ID: %s from %s\n",
-			colorYellow, colorReset, req.FileId, conn.RemoteAddr().String())
-
-		meta, err := store.LoadManifest(req.FileId)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   fmt.Sprintf("manifest not found: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-		manifestBytes, err := json.Marshal(meta)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   fmt.Sprintf("failed to marshal manifest: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-		resp := &protocol.GetMetadataResponse{
-			FileId:       req.FileId,
-			Success:      true,
-			MetadataJson: manifestBytes,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-	})
-
-	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetChunkRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-		chunkData, err := store.ReadChunk(req.FileId, int(req.ChunkIndex))
-		if err != nil {
-			resp := &protocol.GetChunkResponse{
-				FileId:     req.FileId,
-				ChunkIndex: req.ChunkIndex,
-				Success:    false,
-				Error:      fmt.Sprintf("chunk read failed: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-		}
-		resp := &protocol.GetChunkResponse{
-			FileId:     req.FileId,
-			ChunkIndex: req.ChunkIndex,
-			Success:    true,
-			Data:       chunkData,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-	})
-
-	server.OnNewConnection = func(conn *network.Connection) {
-		fmt.Printf("%s[SERVER]%s Connected to new peer: %s\n", colorGreen, colorReset, conn.RemoteAddr().String())
-		conn.SetRouter(router)
-		conn.Start()
-	}
-
-	if err := server.Start(); err != nil {
-		log.Fatalf("failed to start server: %v", err)
-	}
-	fmt.Printf("%s[SERVER]%s TCP Server is listening on %s%s%s...\n", colorGreen, colorReset, colorBold, listenAddr, colorReset)
-
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
-	<-shutdown
-
-	fmt.Printf("\n%s[SERVER]%s Stopping TCP Server...\n", colorYellow, colorReset)
-	server.Stop()
-	fmt.Printf("%s[SERVER]%s Seeder stopped cleanly.\n", colorGreen, colorReset)
-}
-
-//---------------------------------------------------------------------
-// Legacy downloader (no DHT)
-
-func runDownloader(seederAddr, fileID, dataDir, outPath string) {
-	store := storage.NewStore(dataDir)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	dl := downloader.New(fileID, dataDir, nil, store, []string{seederAddr}, 4)
-	_, err := dl.Download(ctx, outPath)
-	if err != nil {
-		log.Fatalf("download failed: %v", err)
-	}
-}
-
-//---------------------------------------------------------------------
-// Helpers
-
-func printHeader() {
-	fmt.Printf("%s%s┌────────────────────────────────────────────────────────┐%s\n", colorBold, colorCyan, colorReset)
-	fmt.Printf("%s%s│             P2P MODEL DISTRIBUTION NODE                │%s\n", colorBold, colorCyan, colorReset)
-	fmt.Printf("%s%s└────────────────────────────────────────────────────────┘%s\n\n", colorBold, colorCyan, colorReset)
-}
-
-func generateRandomID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return fmt.Sprintf("%x", b)
+	return out
 }

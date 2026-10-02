@@ -1,235 +1,298 @@
 package downloader
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/dht"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/filemeta"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/identity"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
 	"google.golang.org/protobuf/proto"
 )
 
-func TestDownloader_HappyPathParallel(t *testing.T) {
-	// 1. Directories setup
-	tempDir, err := os.MkdirTemp("", "p2p-downloader-test-*")
+func newIdentity(t *testing.T) *identity.Identity {
+	t.Helper()
+	id, err := identity.Generate()
 	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
+		t.Fatalf("identity.Generate: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
+	return id
+}
 
-	seederDir := filepath.Join(tempDir, "seeder")
-	downloaderDir := filepath.Join(tempDir, "downloader")
-	os.MkdirAll(seederDir, 0755)
-	os.MkdirAll(downloaderDir, 0755)
+// fastBackoff shrinks retry timings for the duration of a test.
+func fastBackoff(t *testing.T) {
+	t.Helper()
+	ob, om, ow := baseBackoff, maxBackoff, providerWaitTimeout
+	baseBackoff, maxBackoff, providerWaitTimeout = 5*time.Millisecond, 20*time.Millisecond, 2*time.Second
+	t.Cleanup(func() { baseBackoff, maxBackoff, providerWaitTimeout = ob, om, ow })
+}
 
-	// 2. Create sample source file on disk
-	srcFilePath := filepath.Join(tempDir, "source.model")
-	dummyData := make([]byte, 5*1024*1024) // 5 MB file
-	for i := range dummyData {
-		dummyData[i] = byte(i % 256)
+// seedFile stores data in a fresh store and returns the store and manifest.
+func seedFile(t *testing.T, data []byte, chunkSize int) (*storage.Store, filemeta.FileMeta) {
+	t.Helper()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "model.bin")
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if err := os.WriteFile(srcFilePath, dummyData, 0644); err != nil {
-		t.Fatalf("failed to write dummy source: %v", err)
-	}
-
-	// 3. Chunk and seed file using StoreModel
-	seederStore := storage.NewStore(seederDir)
-	fileID := "test-file-id"
-
-	_, _, err = seederStore.StoreModel(srcFilePath, fileID, 1024*1024)
+	store := storage.NewStore(filepath.Join(dir, "store"))
+	meta, err := store.StoreModel(src, chunkSize)
 	if err != nil {
-		t.Fatalf("failed to seed model: %v", err)
+		t.Fatalf("StoreModel: %v", err)
 	}
+	return store, meta
+}
 
-	// 4. Start Seeder TCP Server
-	seederServer := network.NewServer("127.0.0.1:0")
+// seeder configures how a test seeder answers requests.
+type seeder struct {
+	store *storage.Store
+	// manifest, if set, is served for every metadata request.
+	manifest *filemeta.FileMeta
+	// failChunks makes every chunk request fail.
+	failChunks    bool
+	chunkRequests atomic.Int32
+}
+
+// start runs the seeder and returns its address.
+func (s *seeder) start(t *testing.T) string {
+	t.Helper()
 	router := network.NewRouter()
-
 	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
 		var req protocol.GetMetadataRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
+		_ = proto.Unmarshal(env.Payload, &req)
+		meta := s.manifest
+		if meta == nil {
+			loaded, err := s.store.LoadManifest(req.FileId)
+			if err != nil {
+				return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, &protocol.GetMetadataResponse{Error: "not found"})
+			}
+			meta = &loaded
 		}
-		loadedMeta, err := seederStore.LoadManifest(req.FileId)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{FileId: req.FileId, Success: false, Error: err.Error()}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-		mBytes, err := json.Marshal(loadedMeta)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{FileId: req.FileId, Success: false, Error: err.Error()}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-		resp := &protocol.GetMetadataResponse{FileId: req.FileId, Success: true, MetadataJson: mBytes}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
+		b, _ := json.Marshal(meta)
+		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, &protocol.GetMetadataResponse{FileId: req.FileId, Success: true, MetadataJson: b})
 	})
-
 	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
+		s.chunkRequests.Add(1)
 		var req protocol.GetChunkRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
+		_ = proto.Unmarshal(env.Payload, &req)
+		if s.failChunks {
+			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, &protocol.GetChunkResponse{Error: "mock broken server error"})
 		}
-		chunkData, err := seederStore.ReadChunk(req.FileId, int(req.ChunkIndex))
+		fileID := req.FileId
+		if s.manifest != nil {
+			fileID = s.manifest.FileID
+		}
+		data, err := s.store.ReadChunk(fileID, int(req.ChunkIndex))
 		if err != nil {
-			resp := &protocol.GetChunkResponse{FileId: req.FileId, ChunkIndex: req.ChunkIndex, Success: false, Error: err.Error()}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
+			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, &protocol.GetChunkResponse{Error: "not found"})
 		}
-		resp := &protocol.GetChunkResponse{FileId: req.FileId, ChunkIndex: req.ChunkIndex, Success: true, Data: chunkData}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
+		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, &protocol.GetChunkResponse{FileId: req.FileId, ChunkIndex: req.ChunkIndex, Success: true, Data: data})
 	})
 
-	seederServer.OnNewConnection = func(conn *network.Connection) {
+	srv := network.NewServer("127.0.0.1:0", newIdentity(t).ServerTLSConfig())
+	srv.OnNewConnection = func(conn *network.Connection) {
 		conn.SetRouter(router)
 		conn.Start()
 	}
-
-	if err := seederServer.Start(); err != nil {
-		t.Fatalf("failed to start server: %v", err)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start seeder: %v", err)
 	}
-	defer seederServer.Stop()
+	t.Cleanup(srv.Stop)
+	return srv.Addr().String()
+}
 
-	seederAddr := seederServer.Addr().String()
+// newNode starts a DHT node to download through.
+func newNode(t *testing.T) *dht.Service {
+	t.Helper()
+	svc := dht.NewService(newIdentity(t), "127.0.0.1:0", "", nil)
+	if err := svc.Start(); err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(svc.Stop)
+	return svc
+}
 
-	// 5. Run parallel downloader
-	dlStore := storage.NewStore(downloaderDir)
-	dl := New(fileID, downloaderDir, nil, dlStore, []string{seederAddr}, 4)
+func testData(n int) []byte {
+	data := make([]byte, n)
+	for i := range data {
+		data[i] = byte(i*31 + i/7)
+	}
+	return data
+}
 
-	destPath := filepath.Join(tempDir, "assembled.model")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func TestDownloader_HappyPathParallel(t *testing.T) {
+	data := testData(5*1024*1024 + 77)
+	store, meta := seedFile(t, data, 512*1024)
+	addr := (&seeder{store: store}).start(t)
+
+	dlStore := storage.NewStore(t.TempDir())
+	var progressCalls atomic.Int32
+	dl := New(meta.FileID, dlStore, newNode(t), Options{
+		Providers:   []string{addr},
+		Concurrency: 4,
+		Progress:    func(done, total int) { progressCalls.Add(1) },
+	})
+
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-
-	_, err = dl.Download(ctx, destPath)
-	if err != nil {
+	if _, err := dl.Download(ctx, dest); err != nil {
 		t.Fatalf("download failed: %v", err)
 	}
 
-	// 6. Verify contents
-	downloadedData, err := os.ReadFile(destPath)
+	got, err := os.ReadFile(dest)
 	if err != nil {
-		t.Fatalf("failed to read downloaded file: %v", err)
+		t.Fatal(err)
 	}
-
-	if len(downloadedData) != len(dummyData) {
-		t.Errorf("size mismatch: expected %d, got %d", len(dummyData), len(downloadedData))
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded file differs from original")
 	}
-	for i := range dummyData {
-		if downloadedData[i] != dummyData[i] {
-			t.Fatalf("mismatch at byte %d", i)
-		}
+	if int(progressCalls.Load()) != meta.NumChunks {
+		t.Fatalf("progress called %d times, want %d", progressCalls.Load(), meta.NumChunks)
+	}
+	if !dlStore.HasCompleteFile(meta.FileID) {
+		t.Fatal("downloaded file not recorded as complete in the store")
 	}
 }
 
 func TestDownloader_FailoverAndRetry(t *testing.T) {
-	// 1. Directories setup
-	tempDir, err := os.MkdirTemp("", "p2p-downloader-failover-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
+	fastBackoff(t)
+	data := testData(2*1024*1024 + 5)
+	store, meta := seedFile(t, data, 256*1024)
+	broken := (&seeder{store: store, failChunks: true}).start(t)
+	healthy := (&seeder{store: store}).start(t)
+
+	dl := New(meta.FileID, storage.NewStore(t.TempDir()), newNode(t), Options{Providers: []string{broken, healthy}, Concurrency: 2})
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := dl.Download(ctx, dest); err != nil {
+		t.Fatalf("download failed despite healthy seeder: %v", err)
 	}
-	defer os.RemoveAll(tempDir)
-
-	seederDir := filepath.Join(tempDir, "seeder")
-	downloaderDir := filepath.Join(tempDir, "downloader")
-	os.MkdirAll(seederDir, 0755)
-	os.MkdirAll(downloaderDir, 0755)
-
-	// 2. Create sample source file data
-	srcFilePath := filepath.Join(tempDir, "source.model")
-	dummyData := make([]byte, 2*1024*1024) // 2 MB file (2 chunks)
-	for i := range dummyData {
-		dummyData[i] = byte(i % 256)
+	got, _ := os.ReadFile(dest)
+	if !bytes.Equal(got, data) {
+		t.Fatal("downloaded file differs from original")
 	}
-	if err := os.WriteFile(srcFilePath, dummyData, 0644); err != nil {
-		t.Fatalf("failed to write dummy source: %v", err)
-	}
+}
 
-	// 3. Chunk and seed using StoreModel
-	seederStore := storage.NewStore(seederDir)
-	fileID := "test-file-id"
+// TestDownloader_SpreadsLoadAcrossProviders reproduces the old behaviour
+// where every worker picked the first provider with the fewest failures,
+// so all chunks came from a single provider.
+func TestDownloader_SpreadsLoadAcrossProviders(t *testing.T) {
+	data := testData(64 * 32 * 1024)
+	store, meta := seedFile(t, data, 32*1024)
+	a, b := &seeder{store: store}, &seeder{store: store}
+	addrs := []string{a.start(t), b.start(t)}
 
-	_, _, err = seederStore.StoreModel(srcFilePath, fileID, 1024*1024)
-	if err != nil {
-		t.Fatalf("failed to seed model: %v", err)
+	dl := New(meta.FileID, storage.NewStore(t.TempDir()), newNode(t), Options{Providers: addrs, Concurrency: 4})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := dl.Download(ctx, filepath.Join(t.TempDir(), "out.bin")); err != nil {
+		t.Fatalf("download failed: %v", err)
 	}
 
-	// 4. Start Healthy Seeder TCP Server
-	healthyServer := network.NewServer("127.0.0.1:0")
-	router := network.NewRouter()
-
-	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		loadedMeta, _ := seederStore.LoadManifest(fileID)
-		mBytes, _ := json.Marshal(loadedMeta)
-		resp := &protocol.GetMetadataResponse{FileId: fileID, Success: true, MetadataJson: mBytes}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-	})
-
-	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetChunkRequest
-		proto.Unmarshal(env.Payload, &req)
-		chunkData, _ := seederStore.ReadChunk(req.FileId, int(req.ChunkIndex))
-		resp := &protocol.GetChunkResponse{FileId: req.FileId, ChunkIndex: req.ChunkIndex, Success: true, Data: chunkData}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-	})
-
-	healthyServer.OnNewConnection = func(conn *network.Connection) {
-		conn.SetRouter(router)
-		conn.Start()
+	na, nb := a.chunkRequests.Load(), b.chunkRequests.Load()
+	if na == 0 || nb == 0 {
+		t.Fatalf("chunk requests per provider = %d and %d; want both providers used", na, nb)
 	}
-	healthyServer.Start()
-	defer healthyServer.Stop()
+}
 
-	// 5. Start Broken Seeder TCP Server (closes connection or returns errors)
-	brokenServer := network.NewServer("127.0.0.1:0")
-	brokenRouter := network.NewRouter()
+// TestDownloader_FailsFastAndStopsWorkers checks that when a chunk cannot
+// be fetched from anyone, the download fails without the other workers
+// continuing through every remaining chunk.
+func TestDownloader_FailsFastAndStopsWorkers(t *testing.T) {
+	fastBackoff(t)
+	data := testData(200 * 4 * 1024)
+	store, meta := seedFile(t, data, 4*1024)
+	s := &seeder{store: store, failChunks: true}
+	addr := s.start(t)
 
-	brokenRouter.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		loadedMeta, _ := seederStore.LoadManifest(fileID)
-		mBytes, _ := json.Marshal(loadedMeta)
-		resp := &protocol.GetMetadataResponse{FileId: fileID, Success: true, MetadataJson: mBytes}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-	})
-
-	brokenRouter.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		// Returns bad chunk data (corrupt hashes) or fails
-		resp := &protocol.GetChunkResponse{FileId: fileID, ChunkIndex: 0, Success: false, Error: "mock broken server error"}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-	})
-
-	brokenServer.OnNewConnection = func(conn *network.Connection) {
-		conn.SetRouter(brokenRouter)
-		conn.Start()
+	dl := New(meta.FileID, storage.NewStore(t.TempDir()), newNode(t), Options{Providers: []string{addr}, Concurrency: 4})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := dl.Download(ctx, filepath.Join(t.TempDir(), "out.bin")); err == nil {
+		t.Fatal("download succeeded with a provider that serves no chunks")
 	}
-	brokenServer.Start()
-	defer brokenServer.Stop()
+	if n := int(s.chunkRequests.Load()); n > 4*maxChunkAttempts {
+		t.Fatalf("%d chunk requests made after the first fatal failure; workers were not cancelled", n)
+	}
+}
 
-	healthyAddr := healthyServer.Addr().String()
-	brokenAddr := brokenServer.Addr().String()
+// TestDownloader_RejectsSubstitutedManifest simulates a malicious provider
+// that answers every metadata request with a manifest for content of its
+// choosing. The manifest is internally consistent (its chunk hashes match
+// the chunks it serves), so only the CID check can catch it.
+func TestDownloader_RejectsSubstitutedManifest(t *testing.T) {
+	fastBackoff(t)
+	evilStore, evil := seedFile(t, []byte("malicious weights"), 0)
+	_, wanted := seedFile(t, []byte("genuine weights"), 0)
+	addr := (&seeder{store: evilStore, manifest: &evil}).start(t)
 
-	// 6. Downloader Setup with both seeder addresses
-	dlStore := storage.NewStore(downloaderDir)
-	// We put the broken server address first so the downloader hits it initially, fails, and recovers
-	dl := New(fileID, downloaderDir, nil, dlStore, []string{brokenAddr, healthyAddr}, 2)
-
-	destPath := filepath.Join(tempDir, "assembled_failover.model")
+	dl := New(wanted.FileID, storage.NewStore(t.TempDir()), newNode(t), Options{Providers: []string{addr}})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	_, err = dl.Download(ctx, destPath)
-	if err != nil {
-		t.Fatalf("download failed despite healthy seeder: %v", err)
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	if _, err := dl.Download(ctx, dest); err == nil {
+		t.Fatal("download succeeded with a substituted manifest")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("output file was created despite rejected manifest (stat err = %v)", err)
+	}
+}
+
+func TestDownloader_RejectsInvalidFileID(t *testing.T) {
+	dl := New("../../etc", storage.NewStore(t.TempDir()), newNode(t), Options{Providers: []string{"127.0.0.1:1"}})
+	if _, err := dl.Download(context.Background(), ""); err == nil {
+		t.Fatal("download accepted an invalid file ID")
+	}
+}
+
+// TestDownloader_ResumesFromVerifiedChunks simulates an interrupted
+// download: some chunks are already on disk (one of them corrupted).
+// Only the missing and corrupt chunks may be requested again.
+func TestDownloader_ResumesFromVerifiedChunks(t *testing.T) {
+	data := testData(10 * 4 * 1024)
+	store, meta := seedFile(t, data, 4*1024)
+	s := &seeder{store: store}
+	addr := s.start(t)
+
+	dlStore := storage.NewStore(t.TempDir())
+	for _, i := range []int{0, 2, 4, 6, 8} {
+		chunk, err := store.ReadChunk(meta.FileID, i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 8 {
+			chunk = bytes.Repeat([]byte{0}, len(chunk)) // corrupt
+		}
+		if err := dlStore.WriteChunk(meta.FileID, i, chunk); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// 7. Verify contents
-	downloadedData, err := os.ReadFile(destPath)
-	if err != nil {
-		t.Fatalf("failed to read downloaded file: %v", err)
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	dl := New(meta.FileID, dlStore, newNode(t), Options{Providers: []string{addr}})
+	if _, err := dl.Download(ctx, dest); err != nil {
+		t.Fatalf("download failed: %v", err)
 	}
 
-	if len(downloadedData) != len(dummyData) {
-		t.Errorf("size mismatch: expected %d, got %d", len(dummyData), len(downloadedData))
+	if got, want := int(s.chunkRequests.Load()), 6; got != want {
+		t.Fatalf("requested %d chunks, want %d (5 missing + 1 corrupt)", got, want)
+	}
+	got, _ := os.ReadFile(dest)
+	if !bytes.Equal(got, data) {
+		t.Fatal("resumed download differs from original")
 	}
 }

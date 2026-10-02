@@ -24,13 +24,13 @@ func TestRoundTrip(t *testing.T) {
 
 	const chunkSize = 256 * 1024
 	store := storage.NewStore(t.TempDir())
-	meta, _, err := store.StoreModel(srcPath, "file-123", chunkSize)
+	meta, err := store.StoreModel(srcPath, chunkSize)
 	if err != nil {
 		t.Fatalf("StoreModel failed: %v", err)
 	}
 	chunks := meta.Chunks
 	modelHash := meta.ModelHash
-	chunkDir := store.Layout().ChunksDir("file-123")
+	chunkDir := store.Layout().ChunksDir(meta.FileID)
 
 	expectedChunks := (fileSize + chunkSize - 1) / chunkSize
 	if len(chunks) != expectedChunks {
@@ -60,7 +60,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 
 	outPath := t.TempDir() + "/reassembled.bin"
-	if err := filemeta.AssembleChunks(chunkDir, outPath, chunks); err != nil {
+	if err := filemeta.AssembleChunks(chunkDir, outPath, chunks, modelHash); err != nil {
 		t.Fatalf("AssembleChunks: %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestSingleChunk(t *testing.T) {
 	os.WriteFile(srcPath, data, 0644)
 
 	store := storage.NewStore(t.TempDir())
-	meta, _, err := store.StoreModel(srcPath, "file-123", 256*1024)
+	meta, err := store.StoreModel(srcPath, 256*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,8 @@ func TestAssembleChunksHandlesOutofOrder(t *testing.T) {
 		{Index: 1, Size: len(c1)},
 	}
 
-	if err := filemeta.AssembleChunks(chunkDir, outPath, chunks); err != nil {
+	expectedHash := filemeta.HashBytes([]byte("Chunk0-Chunk1-Chunk2"))
+	if err := filemeta.AssembleChunks(chunkDir, outPath, chunks, expectedHash); err != nil {
 		t.Fatalf("AssembleChunks failed: %v", err)
 	}
 
@@ -157,8 +158,29 @@ func TestAssembleChunksRejectsGaps(t *testing.T) {
 		{Index: 2, Size: 1},
 	}
 
-	if err := filemeta.AssembleChunks(chunkDir, outPath, chunks); err == nil {
+	if err := filemeta.AssembleChunks(chunkDir, outPath, chunks, filemeta.HashBytes([]byte("AC"))); err == nil {
 		t.Error("Expected error due to missing chunk at index 1, got nil")
+	}
+	if _, err := os.Stat(outPath); !os.IsNotExist(err) {
+		t.Errorf("output exists after failed assembly (stat err = %v)", err)
+	}
+}
+
+func TestAssembleChunksLeavesNoFileOnHashMismatch(t *testing.T) {
+	chunkDir := t.TempDir()
+	outDir := t.TempDir()
+	outPath := outDir + "/model.bin"
+
+	os.WriteFile(fmt.Sprintf("%s/0.chunk", chunkDir), []byte("corrupted"), 0644)
+	chunks := []filemeta.ChunkMeta{{Index: 0, Size: 9}}
+
+	err := filemeta.AssembleChunks(chunkDir, outPath, chunks, filemeta.HashBytes([]byte("genuine")))
+	if err == nil {
+		t.Fatal("AssembleChunks succeeded despite hash mismatch")
+	}
+	entries, _ := os.ReadDir(outDir)
+	if len(entries) != 0 {
+		t.Fatalf("output dir not empty after failed assembly: %v", entries)
 	}
 }
 

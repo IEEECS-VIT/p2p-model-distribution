@@ -10,21 +10,22 @@ import (
 	"time"
 )
 
-const manifestVersion = "v1"
-
+// BuildManifest reads src in chunkSize pieces and returns the manifest
+// and its CID. The CID is also stored in FileMeta.FileID.
 func BuildManifest(
 	src io.Reader,
-	fileID string,
 	fileName string,
 	fileSize int64,
 	chunkSize int,
 ) (FileMeta, string, error) {
-	return BuildManifestWithChunkWriter(src, fileID, fileName, fileSize, chunkSize, nil)
+	return BuildManifestWithChunkWriter(src, fileName, fileSize, chunkSize, nil)
 }
 
+// BuildManifestWithChunkWriter is BuildManifest but also hands every chunk
+// to writeChunk (if non-nil) so callers can persist chunks in the same
+// streaming pass.
 func BuildManifestWithChunkWriter(
 	src io.Reader,
-	fileID string,
 	fileName string,
 	fileSize int64,
 	chunkSize int,
@@ -33,33 +34,40 @@ func BuildManifestWithChunkWriter(
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
+	if chunkSize < MinChunkSize || chunkSize > MaxChunkSize {
+		return FileMeta{}, "", fmt.Errorf("chunk size %d outside [%d, %d]", chunkSize, MinChunkSize, MaxChunkSize)
+	}
+	if n := (fileSize + int64(chunkSize) - 1) / int64(chunkSize); n > MaxChunks {
+		return FileMeta{}, "", fmt.Errorf("file needs %d chunks at chunk size %d, max is %d; use a larger chunk size", n, chunkSize, MaxChunks)
+	}
 
 	fileHasher := sha256.New()
 	reader := io.TeeReader(src, fileHasher)
 
 	var chunks []ChunkMeta
+	var total int64
 	buf := make([]byte, chunkSize)
 	index := 0
 
 	for {
 		n, readErr := io.ReadFull(reader, buf)
 		if n == 0 {
+			if readErr != nil && readErr != io.EOF {
+				return FileMeta{}, "", fmt.Errorf("read chunk %d: %w", index, readErr)
+			}
 			break
 		}
 		if readErr != nil && readErr != io.ErrUnexpectedEOF {
 			return FileMeta{}, "", fmt.Errorf("read chunk %d: %w", index, readErr)
 		}
 
-		data := append([]byte(nil), buf[:n]...)
-		chunkDigest := sha256.Sum256(data)
-		chunkHash := "sha256:" + hex.EncodeToString(chunkDigest[:])
-
+		data := buf[:n]
 		chunks = append(chunks, ChunkMeta{
 			Index: index,
-			CID:   chunkHash,
-			Hash:  chunkHash,
+			Hash:  HashBytes(data),
 			Size:  n,
 		})
+		total += int64(n)
 
 		if writeChunk != nil {
 			if err := writeChunk(index, data); err != nil {
@@ -73,14 +81,17 @@ func BuildManifestWithChunkWriter(
 		}
 	}
 
+	if total != fileSize {
+		return FileMeta{}, "", fmt.Errorf("read %d bytes, expected %d (file changed while chunking?)", total, fileSize)
+	}
+
 	meta := FileMeta{
-		FileID:    fileID,
 		FileName:  fileName,
 		FileSize:  fileSize,
 		ModelHash: "sha256:" + hex.EncodeToString(fileHasher.Sum(nil)),
 		ChunkSize: chunkSize,
 		NumChunks: len(chunks),
-		Version:   manifestVersion,
+		Version:   ManifestVersion,
 		CreatedAt: time.Now().Unix(),
 		Chunks:    chunks,
 	}
@@ -89,6 +100,7 @@ func BuildManifestWithChunkWriter(
 	if err != nil {
 		return FileMeta{}, "", err
 	}
+	meta.FileID = cid
 
 	return meta, cid, nil
 }
@@ -115,17 +127,16 @@ func LoadManifest(path string) (FileMeta, error) {
 	return meta, err
 }
 
-// LoadManifestBytes returns the raw JSON bytes of a manifest file.
-// Use this when you need to serve the manifest over HTTP without
-// round-tripping through unmarshal → marshal.
-func LoadManifestBytes(path string) ([]byte, error) {
-	return os.ReadFile(path)
-}
-
+// GenerateManifestCID returns the hex SHA-256 of the manifest's
+// content-identifying fields. It deliberately excludes FileID (which is
+// the CID itself), FileName and CreatedAt, so the same content always gets
+// the same ID. FileName is therefore unauthenticated metadata and must be
+// validated before use (see ValidateFileName).
+//
+// The encoding is the JSON serialization of a fixed struct; Go's encoder
+// emits struct fields in declaration order with no insignificant
+// whitespace, so it is canonical for a given set of values.
 func GenerateManifestCID(meta FileMeta) (string, error) {
-	// Use only content-identifying fields to compute the CID.
-	// This ensures that the CID is identical for the same content, even if CreatedAt,
-	// FileName, or FileID differ.
 	type StableMeta struct {
 		FileSize  int64       `json:"file_size"`
 		ModelHash string      `json:"model_hash"`
@@ -135,13 +146,19 @@ func GenerateManifestCID(meta FileMeta) (string, error) {
 		Chunks    []ChunkMeta `json:"chunks"`
 	}
 
+	chunks := meta.Chunks
+	if chunks == nil {
+		// nil and empty must hash identically ("[]", not "null").
+		chunks = []ChunkMeta{}
+	}
+
 	stable := StableMeta{
 		FileSize:  meta.FileSize,
 		ModelHash: meta.ModelHash,
 		ChunkSize: meta.ChunkSize,
 		Version:   meta.Version,
 		NumChunks: meta.NumChunks,
-		Chunks:    meta.Chunks,
+		Chunks:    chunks,
 	}
 
 	data, err := json.Marshal(stable)

@@ -1,18 +1,9 @@
 package dht
 
-import (
-	"crypto/sha256"
-	"encoding/hex"
-	"strconv"
-)
+import "crypto/sha256"
 
 func Hash(data []byte) [32]byte {
 	return sha256.Sum256(data)
-}
-
-func HashString(data []byte) string {
-	sum := Hash(data)
-	return hex.EncodeToString(sum[:])
 }
 
 func distanceBytes(a string, b string) []byte {
@@ -47,8 +38,4 @@ func leadingBitOffset(value byte) int {
 	}
 
 	return 7
-}
-
-func itoa(value int) string {
-	return strconv.Itoa(value)
 }

@@ -13,19 +13,21 @@ func TestBuildManifestPopulatesDerivedFields(t *testing.T) {
 	srcData := []byte("012345678901234567890123456789")
 	reader := bytes.NewReader(srcData)
 
+	srcData = bytes.Repeat(srcData, 100) // 3000 bytes
+	reader = bytes.NewReader(srcData)
+
 	meta, cid, err := BuildManifest(
 		reader,
-		"file-123",
 		"model.bin",
 		int64(len(srcData)),
-		10,
+		MinChunkSize,
 	)
 	if err != nil {
 		t.Fatalf("BuildManifest: %v", err)
 	}
 
-	if meta.FileID != "file-123" {
-		t.Fatalf("FileID = %q, want %q", meta.FileID, "file-123")
+	if meta.FileID != cid {
+		t.Fatalf("FileID = %q, want manifest CID %q", meta.FileID, cid)
 	}
 	if meta.FileName != "model.bin" {
 		t.Fatalf("FileName = %q, want %q", meta.FileName, "model.bin")
@@ -38,8 +40,8 @@ func TestBuildManifestPopulatesDerivedFields(t *testing.T) {
 	if meta.ModelHash != expectedModelHash {
 		t.Fatalf("ModelHash = %q, want %q", meta.ModelHash, expectedModelHash)
 	}
-	if meta.Version != manifestVersion {
-		t.Fatalf("Version = %q, want %q", meta.Version, manifestVersion)
+	if meta.Version != ManifestVersion {
+		t.Fatalf("Version = %q, want %q", meta.Version, ManifestVersion)
 	}
 	if meta.CreatedAt == 0 {
 		t.Fatal("CreatedAt = 0, want non-zero unix timestamp")
@@ -47,11 +49,14 @@ func TestBuildManifestPopulatesDerivedFields(t *testing.T) {
 	if meta.NumChunks != 3 {
 		t.Fatalf("NumChunks = %d, want %d", meta.NumChunks, 3)
 	}
-	if meta.Chunks[0].CID != meta.Chunks[0].Hash {
-		t.Fatalf("chunk 0 CID = %q, want %q", meta.Chunks[0].CID, meta.Chunks[0].Hash)
+	if meta.Chunks[2].Size != 3000-2*MinChunkSize {
+		t.Fatalf("chunk 2 size = %d, want %d", meta.Chunks[2].Size, 3000-2*MinChunkSize)
 	}
-	if meta.Chunks[2].Size != 10 {
-		t.Fatalf("chunk 2 size = %d, want %d", meta.Chunks[2].Size, 10)
+	if err := meta.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if err := meta.VerifyID(cid); err != nil {
+		t.Fatalf("VerifyID: %v", err)
 	}
 
 	expectedCID, err := GenerateManifestCID(meta)
@@ -71,10 +76,10 @@ func TestGenerateManifestCIDStable(t *testing.T) {
 		ModelHash: "sha256:model",
 		ChunkSize: 1024,
 		NumChunks: 1,
-		Version:   manifestVersion,
+		Version:   ManifestVersion,
 		CreatedAt: 1234567890,
 		Chunks: []ChunkMeta{
-			{Index: 0, CID: "sha256:aaa", Hash: "sha256:aaa", Size: 30},
+			{Index: 0, Hash: "sha256:aaa", Size: 30},
 		},
 	}
 
@@ -101,10 +106,10 @@ func TestSaveLoadManifestRoundTrip(t *testing.T) {
 		ModelHash: "sha256:model",
 		ChunkSize: 1024,
 		NumChunks: 1,
-		Version:   manifestVersion,
+		Version:   ManifestVersion,
 		CreatedAt: 1234567890,
 		Chunks: []ChunkMeta{
-			{Index: 0, CID: "sha256:aaa", Hash: "sha256:aaa", Size: 30},
+			{Index: 0, Hash: "sha256:aaa", Size: 30},
 		},
 	}
 	outPath := filepath.Join(t.TempDir(), "manifest.json")
@@ -131,10 +136,10 @@ func TestGenerateManifestCIDIgnoresMetadata(t *testing.T) {
 		ModelHash: "sha256:model",
 		ChunkSize: 1024,
 		NumChunks: 1,
-		Version:   manifestVersion,
+		Version:   ManifestVersion,
 		CreatedAt: 1234567890,
 		Chunks: []ChunkMeta{
-			{Index: 0, CID: "sha256:aaa", Hash: "sha256:aaa", Size: 30},
+			{Index: 0, Hash: "sha256:aaa", Size: 30},
 		},
 	}
 
@@ -145,10 +150,10 @@ func TestGenerateManifestCIDIgnoresMetadata(t *testing.T) {
 		ModelHash: "sha256:model",
 		ChunkSize: 1024,
 		NumChunks: 1,
-		Version:   manifestVersion,
+		Version:   ManifestVersion,
 		CreatedAt: 9876543210, // different timestamp
 		Chunks: []ChunkMeta{
-			{Index: 0, CID: "sha256:aaa", Hash: "sha256:aaa", Size: 30},
+			{Index: 0, Hash: "sha256:aaa", Size: 30},
 		},
 	}
 
@@ -164,5 +169,61 @@ func TestGenerateManifestCIDIgnoresMetadata(t *testing.T) {
 
 	if cid1 != cid2 {
 		t.Fatalf("Expected CIDs to be identical regardless of FileID, FileName, or CreatedAt; got %q and %q", cid1, cid2)
+	}
+}
+
+func TestVerifyIDRejectsTamperedManifest(t *testing.T) {
+	data := bytes.Repeat([]byte("model weights "), 1000)
+	meta, cid, err := BuildManifest(bytes.NewReader(data), "model.bin", int64(len(data)), MinChunkSize)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+
+	tampered := meta
+	tampered.Chunks = append([]ChunkMeta(nil), meta.Chunks...)
+	tampered.Chunks[0].Hash = HashBytes([]byte("malicious"))
+	if err := tampered.VerifyID(cid); err == nil {
+		t.Fatal("VerifyID accepted a manifest with a substituted chunk hash")
+	}
+
+	tampered = meta
+	tampered.ModelHash = HashBytes([]byte("malicious"))
+	if err := tampered.VerifyID(cid); err == nil {
+		t.Fatal("VerifyID accepted a manifest with a substituted model hash")
+	}
+
+	// Unauthenticated metadata does not affect the ID.
+	renamed := meta
+	renamed.FileName = "other.bin"
+	if err := renamed.VerifyID(cid); err != nil {
+		t.Fatalf("VerifyID rejected renamed manifest: %v", err)
+	}
+}
+
+func TestBuildManifestRejectsOutOfRangeChunkSize(t *testing.T) {
+	for _, size := range []int{MinChunkSize - 1, MaxChunkSize + 1} {
+		if _, _, err := BuildManifest(bytes.NewReader([]byte("x")), "m.bin", 1, size); err == nil {
+			t.Errorf("BuildManifest accepted chunk size %d", size)
+		}
+	}
+}
+
+func TestBuildManifestRejectsSizeMismatch(t *testing.T) {
+	if _, _, err := BuildManifest(bytes.NewReader([]byte("short")), "m.bin", 100, MinChunkSize); err == nil {
+		t.Fatal("BuildManifest accepted a reader shorter than fileSize")
+	}
+}
+
+func TestEmptyFileManifest(t *testing.T) {
+	meta, cid, err := BuildManifest(bytes.NewReader(nil), "empty.bin", 0, MinChunkSize)
+	if err != nil {
+		t.Fatalf("BuildManifest: %v", err)
+	}
+	if err := meta.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	meta.Chunks = []ChunkMeta{} // as decoded from "chunks": []
+	if err := meta.VerifyID(cid); err != nil {
+		t.Fatalf("VerifyID with empty (non-nil) chunks: %v", err)
 	}
 }

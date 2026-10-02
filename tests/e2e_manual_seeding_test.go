@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,11 +12,22 @@ import (
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/dht"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/downloader"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/filemeta"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/identity"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/transfer"
 	"google.golang.org/protobuf/proto"
 )
+
+func newIdentity(t *testing.T) *identity.Identity {
+	t.Helper()
+	id, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("identity.Generate: %v", err)
+	}
+	return id
+}
 
 func TestEndToEnd_P2PDistribution(t *testing.T) {
 	// 1. Prepare temporary workspaces for Seeder and Downloader nodes
@@ -38,83 +48,21 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 	// 2. Seeder Node Setup: Store model locally (creating manifest & chunks)
 	seederStore := storage.NewStore(seederDir)
 	chunkSize := 10 * 1024 // 10 KB chunk size
-	fileID := "model-v1-e2e"
-
-	meta, _, err := seederStore.StoreModel(srcPath, fileID, chunkSize)
+	meta, err := seederStore.StoreModel(srcPath, chunkSize)
 	if err != nil {
 		t.Fatalf("failed to seed model locally: %v", err)
 	}
+	fileID := meta.FileID
 
 	if len(meta.Chunks) != 11 {
 		t.Errorf("expected 11 chunks for 105KB file with 10KB chunk size, got %d", len(meta.Chunks))
 	}
 
 	// 3. Start Seeder TCP Server and register RPC handlers
-	seederServer := network.NewServer("127.0.0.1:0")
+	seederServer := network.NewServer("127.0.0.1:0", newIdentity(t).ServerTLSConfig())
 	router := network.NewRouter()
 
-	// Handle GetMetadata RPC
-	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetMetadataRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-
-		// Load manifest from storage
-		meta, err := seederStore.LoadManifest(req.FileId)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   err.Error(),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-
-		manifestBytes, err := json.Marshal(meta)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   err.Error(),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-
-		resp := &protocol.GetMetadataResponse{
-			FileId:        req.FileId,
-			Success:       true,
-			MetadataJson: manifestBytes,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-	})
-
-	// Handle GetChunk RPC
-	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetChunkRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-
-		chunkData, err := seederStore.ReadChunk(req.FileId, int(req.ChunkIndex))
-		if err != nil {
-			resp := &protocol.GetChunkResponse{
-				FileId:     req.FileId,
-				ChunkIndex: req.ChunkIndex,
-				Success:    false,
-				Error:      err.Error(),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-		}
-
-		resp := &protocol.GetChunkResponse{
-			FileId:     req.FileId,
-			ChunkIndex: req.ChunkIndex,
-			Success:    true,
-			Data:       chunkData,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-	})
+	transfer.NewServer(seederStore).Register(router)
 
 	seederServer.OnNewConnection = func(conn *network.Connection) {
 		conn.SetRouter(router)
@@ -128,13 +76,11 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 
 	// 4. Downloader Node Setup: Connect to Seeder and run RPC download loop
 	seederAddr := seederServer.Addr().String()
-	rawConn, err := net.Dial("tcp", seederAddr)
+	downloaderConn, err := network.Dial(context.Background(), seederAddr, newIdentity(t).ClientTLSConfig(""))
 	if err != nil {
 		t.Fatalf("failed to dial seeder node: %v", err)
 	}
-	defer rawConn.Close()
-
-	downloaderConn := network.NewConnection(rawConn, "downloader-node")
+	defer downloaderConn.Close()
 	downloaderConn.Start()
 
 	downloaderStore := storage.NewStore(downloaderDir)
@@ -221,12 +167,13 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 
 	// Step D: Reassemble the chunks into the final destination file
 	assembledPath := filepath.Join(downloaderDir, downloadedMeta.FileName)
-	
+
 	// Convert downloaderStore paths into slice of ChunkMeta
 	if err := filemeta.AssembleChunks(
 		downloaderStore.Layout().ChunksDir(fileID),
 		assembledPath,
 		downloadedMeta.Chunks,
+		downloadedMeta.ModelHash,
 	); err != nil {
 		t.Fatalf("failed to reassemble chunks: %v", err)
 	}
@@ -264,7 +211,7 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 	}
 
 	// 2. Start Bootstrap Node
-	bootstrapSvc := dht.NewService("bootstrap-node", "127.0.0.1:0", "", nil)
+	bootstrapSvc := dht.NewService(newIdentity(t), "127.0.0.1:0", "", nil)
 	if err := bootstrapSvc.Start(); err != nil {
 		t.Fatalf("failed to start bootstrap service: %v", err)
 	}
@@ -273,31 +220,15 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 
 	// 3. Start Seeder Node with file registered
 	seederStore := storage.NewStore(seederDir)
-	fileID := "dht-model-test-id"
-	_, _, err := seederStore.StoreModel(srcPath, fileID, 20*1024) // 20 KB chunks
+	seeded, err := seederStore.StoreModel(srcPath, 20*1024) // 20 KB chunks
+	fileID := seeded.FileID
 	if err != nil {
 		t.Fatalf("failed to store model on seeder: %v", err)
 	}
 
-	seederSvc := dht.NewService("seeder-node", "127.0.0.1:0", "", []string{bootstrapAddr})
-	
-	// Register file transfer handlers on seeder DHT router
-	seederRouter := seederSvc.Router()
-	seederRouter.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetMetadataRequest
-		proto.Unmarshal(env.Payload, &req)
-		loadedMeta, _ := seederStore.LoadManifest(req.FileId)
-		mBytes, _ := json.Marshal(loadedMeta)
-		resp := &protocol.GetMetadataResponse{FileId: req.FileId, Success: true, MetadataJson: mBytes}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-	})
-	seederRouter.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetChunkRequest
-		proto.Unmarshal(env.Payload, &req)
-		chunkData, _ := seederStore.ReadChunk(req.FileId, int(req.ChunkIndex))
-		resp := &protocol.GetChunkResponse{FileId: req.FileId, ChunkIndex: req.ChunkIndex, Success: true, Data: chunkData}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-	})
+	seederSvc := dht.NewService(newIdentity(t), "127.0.0.1:0", "", []string{bootstrapAddr})
+
+	transfer.NewServer(seederStore).Register(seederSvc.Router())
 
 	if err := seederSvc.Start(); err != nil {
 		t.Fatalf("failed to start seeder service: %v", err)
@@ -308,11 +239,11 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Announce file ID
-	seederSvc.AnnounceProvider(fileID)
+	seederSvc.AnnounceProvider(context.Background(), fileID)
 
 	// 4. Start Downloader Node
 	downloaderStore := storage.NewStore(downloaderDir)
-	downloaderSvc := dht.NewService("downloader-node", "127.0.0.1:0", "", []string{bootstrapAddr})
+	downloaderSvc := dht.NewService(newIdentity(t), "127.0.0.1:0", "", []string{bootstrapAddr})
 	if err := downloaderSvc.Start(); err != nil {
 		t.Fatalf("failed to start downloader service: %v", err)
 	}
@@ -322,7 +253,7 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// 5. Run Downloader with DHT fallback enabled (passing nil initialProviders)
-	dl := downloader.New(fileID, downloaderDir, downloaderSvc, downloaderStore, nil, 2)
+	dl := downloader.New(fileID, downloaderStore, downloaderSvc, downloader.Options{Concurrency: 2})
 
 	assembledPath := filepath.Join(downloaderDir, "dht-assembled.bin")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

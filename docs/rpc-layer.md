@@ -1,224 +1,123 @@
-# Custom Multiplexed TCP RPC & Protobuf Layer
+# Network & RPC Layer
 
-This document provides a detailed technical explanation of the custom peer-to-peer (P2P) RPC and messaging layer built over TCP. The layer uses Google Protocol Buffers (Protobuf) for structured message payloads, custom length-prefix framing for socket boundaries, and asynchronous multiplexing to handle concurrent request-response loops over single TCP sockets.
+`internal/network` carries every interaction between peers. That covers DHT
+traffic and file transfer, multiplexed over one authenticated connection
+per peer pair.
 
----
+## 1. Transport: mutual TLS 1.3
 
-## 1. Core Architecture & Design Philosophy
+Every connection is TLS 1.3 with **both** sides presenting a certificate.
+Certificates are self-signed and carry the node's ed25519 key (see
+`internal/identity`):
 
-In a production P2P file/model distribution network, standard application protocols like HTTP/1.1 or HTTP/2 introduce substantial framing overhead, lack pure symmetric bi-directional request dispatching out-of-the-box, or pull in heavy dependencies (e.g. gRPC or `libp2p`).
+- The **node ID** is `hex(SHA-256(ed25519 public key))`, so claiming an ID
+  requires the matching private key.
+- Each side checks that the peer presented exactly one currently valid,
+  self-signed ed25519 certificate. The TLS handshake itself proves the peer
+  holds the private key. The peer's node ID is then derived from the
+  certificate and exposed as `Connection.PeerID()`.
+- When dialing a node whose ID is already known (e.g. from a DHT
+  response), `identity.ClientTLSConfig(expectedID)` **pins** that ID, and
+  the handshake fails if anyone else answers.
+- ALPN `p2p-model-distribution/2` versions the protocol, so incompatible
+  nodes fail the handshake instead of exchanging garbage.
 
-To maintain a lightweight, zero-dependency foundation, this project implements a custom P2P communication layer directly over TCP. The core requirements satisfied by this design are:
-* **Message Framing:** Raw TCP is a continuous byte stream with no message boundaries. We prefix every message with a 4-byte header specifying payload length.
-* **Type Safety:** Payloads are serialized using Google Protocol Buffers for robust, schema-driven serialization.
-* **Multiplexing:** Multiple requests and responses are sent concurrently over a single TCP connection. A background goroutine reads incoming frames and matches responses back to their originating callers using request IDs.
-* **Symmetric Routing:** A node can simultaneously act as an RPC client (sending requests) and an RPC server (routing incoming requests to registered handlers) on the same socket connection.
+```go
+srv := network.NewServer(":9000", id.ServerTLSConfig())
+conn, err := network.Dial(ctx, "10.0.0.5:9000", id.ClientTLSConfig(expectedID))
+```
 
----
+The server runs each handshake in its own goroutine with a
+`HandshakeTimeout` (10s), so a peer that connects and stalls neither
+blocks the accept loop nor holds a slot for long.
 
-## 2. Framing Layer (Length-Prefix Boundary)
+## 2. Framing
 
-Since TCP is stream-oriented, the socket layer must know how many bytes constitute a complete application message. The project implements a length-prefix frame writer and reader in `internal/network/connection.go`:
+TCP is a byte stream, so every message is length-prefixed:
 
 ```
-┌───────────────────────────┬───────────────────────────────────────────┐
-│ Length Prefix (4 Bytes)   │        Protobuf Envelope (Variable)       │
-│ Big-Endian uint32         │  [Envelope ID, Message Type, Payload]     │
-└───────────────────────────┴───────────────────────────────────────────┘
++----------------------+-----------------------------+
+| 4-byte length (BE)   | payload (protobuf Envelope) |
++----------------------+-----------------------------+
 ```
 
-* **Writing (`WriteFrame`):** Serializes the protobuf message into bytes, calculates the length $N$, writes $N$ as a 4-byte big-endian unsigned integer (`binary.BigEndian.PutUint32`), followed by the $N$ payload bytes.
-* **Reading (`ReadFrame`):** Reads exactly 4 bytes from the socket to determine the payload length $N$. Then, performs a buffered, full read (`io.ReadFull`) of exactly $N$ bytes to isolate the serialized protobuf frame.
+- `MaxMessageSize` (10 MiB) is enforced on both read and write. A
+  manifest's chunk size is capped at 8 MiB so a chunk always fits in one
+  frame.
+- A frame is written with a single `Write`, and writes on a connection are
+  serialized by a dedicated mutex.
 
----
-
-## 3. Protocol Buffers Schema (`proto/p2p.proto`)
-
-The communication schema defines standard structured message envelopes and operational payloads.
-
-### Message Envelope
-Every message sent across the network is wrapped inside an `Envelope` structure. This ensures the receiver can read, dispatch, and deserialize payloads safely.
+## 3. Envelope and messages (`proto/p2p.proto`)
 
 ```protobuf
-syntax = "proto3";
-package protocol;
-option go_package = "github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol";
-
-enum MessageType {
-  MSG_UNKNOWN = 0;
-  MSG_HANDSHAKE_REQUEST = 1;
-  MSG_HANDSHAKE_RESPONSE = 2;
-  MSG_GET_METADATA_REQUEST = 3;
-  MSG_GET_METADATA_RESPONSE = 4;
-  MSG_GET_CHUNK_REQUEST = 5;
-  MSG_GET_CHUNK_RESPONSE = 6;
-}
-
 message Envelope {
-  string id = 1;          // Unique request ID (UUID) for matching responses
-  MessageType type = 2;   // Enum specifying what payload is enclosed
-  bytes payload = 3;      // Marshallled sub-message bytes
+    string id = 1;          // pairs a response with its request
+    MessageType type = 2;
+    bytes payload = 3;      // serialized inner message
+    bool is_response = 4;   // responses are never routed to handlers
 }
 ```
 
-### Operational Message Payloads
+| Request | Response | Payload |
+|---------|----------|---------|
+| `MSG_GET_METADATA_REQUEST` | `MSG_GET_METADATA_RESPONSE` | `GetMetadataRequest` / `GetMetadataResponse` (manifest JSON) |
+| `MSG_GET_CHUNK_REQUEST` | `MSG_GET_CHUNK_RESPONSE` | `GetChunkRequest` / `GetChunkResponse` |
+| `MSG_DHT_PING` | `MSG_DHT_PONG` | `DHTRequest` / `DHTResponse` |
+| `MSG_DHT_FIND_NODE` | `MSG_DHT_FIND_NODE_RESPONSE` | `DHTRequest` / `DHTResponse` |
+| `MSG_DHT_FIND_VALUE` | `MSG_DHT_FIND_VALUE_RESPONSE` | `DHTRequest` / `DHTResponse` |
+| `MSG_DHT_ADD_PROVIDER` | `MSG_DHT_ADD_PROVIDER_RESPONSE` | `DHTRequest` / `DHTResponse` |
+| any | `MSG_ERROR` | `ErrorResponse` |
 
-#### 1. Handshake
-Exchanged immediately upon socket establishment to authenticate identity, check network protocol versions, and exchange public parameters.
-```protobuf
-message HandshakeRequest {
-  string peer_id = 1;
-  string version = 2;
-}
+No message carries the sender's node ID or IP. The sender is always the
+TLS-authenticated peer.
 
-message HandshakeResponse {
-  string peer_id = 1;
-  bool success = 2;
-  string error = 3;
-}
-```
+## 4. Multiplexing (`connection.go`)
 
-#### 2. Get Metadata (Manifest)
-Queries a peer for a file manifest JSON by its stable `FileID`. 
-```protobuf
-message GetMetadataRequest {
-  string file_id = 1;
-}
+Each `Connection` runs one read loop:
 
-message GetMetadataResponse {
-  string file_id = 1;
-  bool success = 2;
-  bytes metadata_json = 3; // Serialized filemeta.FileMeta structure
-  string error = 4;
-}
-```
-> **Design Note:** Rather than recreating the complex hierarchical `FileMeta` struct inside the protobuf schema, it is marshaled to JSON on the sender side and packed into `metadata_json`. This isolates Go struct field updates from wire-protocol schema drift.
+1. Read a frame (with `ReadIdleTimeout`, 2 min, reset per frame). If the
+   frame is not a valid `Envelope`, it is a protocol violation and the
+   connection is closed.
+2. If `is_response` is set, look up the pending request with that `id`,
+   **remove it**, and hand the response over. Duplicate, late or
+   unsolicited responses are dropped, so they can never block the loop.
+3. Otherwise it is a request. The loop dispatches it to the router in a
+   goroutine, with at most 32 handlers in flight per connection. When that
+   limit is hit the loop waits, which applies backpressure to the peer.
 
-#### 3. Get Chunk
-Requests raw block data for a specific chunk index of a file.
-```protobuf
-message GetChunkRequest {
-  string file_id = 1;
-  int32 chunk_index = 2;
-}
+`SendRequest` registers a pending request, writes the envelope, and waits
+for the response, the context deadline, or connection teardown (which
+fails all pending requests immediately). A `MSG_ERROR` reply is returned as
+a `*RemoteError`.
 
-message GetChunkResponse {
-  string file_id = 1;
-  int32 chunk_index = 2;
-  bool success = 3;
-  bytes data = 4;        // Raw chunk content
-  string error = 5;
-}
-```
+`Done()` is closed when a connection is torn down. The DHT connection
+pool uses it to drop dead connections.
 
----
+## 5. Routing (`router.go`)
 
-## 4. Connection Multiplexing & Request Matching
-
-The `Connection` struct (`internal/network/connection.go`) manages read/write coordination.
-
-### Struct Anatomy
 ```go
-type Connection struct {
-	conn            net.Conn
-	peerID          string
-	Incoming        chan []byte
-	router          *Router
-	
-	mu              sync.Mutex
-	pendingRequests map[string]chan *protocol.Envelope // Maps RequestID -> Reply Channel
-	closed          bool
-}
+router := network.NewRouter()
+router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, handler)
 ```
 
-### Asynchronous Read Loop (`readLoop`)
-When `Start()` is called, a background goroutine executes `readLoop()`:
-1. It continuously calls `ReadFrame()` to extract the raw byte payload.
-2. It attempts to parse the payload as a `protocol.Envelope`.
-   * **Backward Compatibility Fallback:** If parsing fails, the raw bytes are pushed directly to `Incoming` (allowing non-RPC raw framing tests to pass).
-3. If it is a valid RPC envelope:
-   * **Inbound Response:** If the envelope's `Id` exists in the `pendingRequests` registry map, it means a local caller is waiting for this response. The envelope is dispatched directly into the associated waiting channel.
-   * **Inbound Request:** If the envelope's `Id` is not registered in our map, the envelope is treated as an incoming RPC request from the remote peer. The request is dispatched to the connection's registered `Router` for execution.
+- If no handler is registered for a type, the requester gets
+  `MSG_ERROR "unsupported message type"` instead of waiting for a timeout.
+- If a handler fails, the requester gets a generic `MSG_ERROR "request
+  failed"`. Only errors that wrap `network.ErrBadRequest` have their
+  message passed on, so local paths and OS errors never leak to peers.
+- `Router` is safe for concurrent use.
 
-### RPC Requests (`SendRequest`)
-To send an RPC and block on the response:
-```go
-func (c *Connection) SendRequest(ctx context.Context, msgType protocol.MessageType, reqMsg proto.Message) (*protocol.Envelope, error)
-```
-1. **Serialization:** Marshals the inner request message payload (`reqMsg`).
-2. **Envelope Creation:** Wraps it in a `protocol.Envelope`, generating a random UUID string as the request `id`.
-3. **Register Wait-Channel:** Creates a channel `ch := make(chan *protocol.Envelope, 1)` and registers it in the `pendingRequests` map under the generated `id`.
-4. **Transmission:** Writes the length-prefixed frame to the TCP socket.
-5. **Blocking Wait:** Listens on a select statement matching:
-   * `case resp := <-ch`: Handled response received from the `readLoop`. Returns the response envelope.
-   * `case <-ctx.Done()`: Context timeout or cancellation occurred. Unregisters the wait-channel to prevent leaks and returns a timeout error.
+## 6. Resource limits
 
----
+| Limit | Value | Purpose |
+|-------|-------|---------|
+| `DefaultMaxConnections` | 512 inbound | file descriptor / memory exhaustion |
+| `HandshakeTimeout` | 10s | stalled TLS handshakes |
+| `ReadIdleTimeout` | 2 min per frame | slow-loris peers |
+| `WriteTimeout` | 15s per write | peers that never drain their receive window |
+| handlers in flight | 32 per connection | request floods |
+| `MaxMessageSize` | 10 MiB | oversized frames |
 
-## 5. Request Routing (`internal/network/router.go`)
-
-The router acts as the server-side dispatching engine. It registers callback handlers mapping specific `protocol.MessageType` enums to custom executable logic.
-
-### Router Interface
-```go
-type HandlerFunc func(conn *Connection, env *protocol.Envelope) error
-
-type Router struct {
-	handlers map[protocol.MessageType]HandlerFunc
-}
-```
-
-* **`Register(msgType, HandlerFunc)`:** Attaches a handler to a message type.
-* **`Route(conn, envelope)`:** Invoked by the connection's `readLoop` upon receiving an unregistered envelope ID. Locates the correct handler and executes it.
-
-### Handler Replying (`WriteResponse`)
-Handlers execute their business logic and send responses using `WriteResponse`:
-```go
-func (c *Connection) WriteResponse(reqID string, msgType protocol.MessageType, respMsg proto.Message) error {
-    // Marshals the response payload
-    // Packages it into an Envelope containing the SAME reqID as the request
-    // Writes it as a length-prefixed frame back to the socket
-}
-```
-
----
-
-## 6. End-to-End Execution Sequence
-
-This sequence diagram illustrates a downloader node requesting chunk `0` from a seeder node:
-
-```
-Downloader (Client Node)                   Seeder (Server Node)
-   │                                          │
-   │─── SendRequest (GetChunkRequest) ────────► (Read TCP Frame)
-   │    UUID ID: "abc-123"                    │
-   │                                          │─── Parse Envelope
-   │                                          │─── Dispatch to Router
-   │                                          │─── Execute GetChunk Handler
-   │                                          │    (Load chunk index 0 from disk)
-   │                                          │
-   │◄── WriteResponse (GetChunkResponse) ─────│
-   │    UUID ID: "abc-123"                    │
-   │                                          │
-(Read TCP Frame)                              │
-   │                                          │
-Verify envelope ID ("abc-123") in map         │
-Dispatch to waiting channel                   │
-Verify chunk hash & save to disk              │
-```
-
----
-
-## 7. Testing & CLI Drivers
-
-### Integration Tests
-A full end-to-end simulation is located at [p2p_transfer_e2e_test.go](file:///home/daksh/Documents/github/p2p-model-distribution/tests/p2p_transfer_e2e_test.go). This test:
-1. Spawns a TCP server with a registered RPC router.
-2. Connects a client connection to it.
-3. Transits file metadata manifests and chunk arrays over the network.
-4. Verifies hashes and assembles them back to check byte integrity.
-
-### Run-Time Binary (`cmd/node/main.go`)
-Allows manual local or cross-network testing.
-* **Seed mode:** Chunk files and serve them over the custom TCP server.
-* **Download mode:** Dial a seeder, pull metadata, request chunks, and reassemble them.
+`Server.Stop()` is idempotent and closes every accepted connection,
+including ones still handshaking. Persistent accept errors (e.g. `EMFILE`)
+back off exponentially instead of spinning.

@@ -1,6 +1,8 @@
 package filemeta
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -8,43 +10,67 @@ import (
 	"sort"
 )
 
-func AssembleChunks(chunkDir, outputPath string, chunks []ChunkMeta) error {
-	if len(chunks) == 0 {
-		return fmt.Errorf("no chunks provided for assembly")
-	}
-
-	out, err := os.Create(outputPath)
-	if err != nil {
-		return fmt.Errorf("create output: %w", err)
-	}
-	defer out.Close()
-
-	// Create a copy of the slice to avoid modifying the caller's slice
+// AssembleChunks concatenates the chunk files in chunkDir into outputPath
+// and checks the result against modelHash. The output is written to a
+// temporary file in the same directory, synced, verified, and only then
+// renamed into place, so outputPath never holds a partial or corrupt file
+// (an existing file at outputPath is left untouched on failure).
+func AssembleChunks(chunkDir, outputPath string, chunks []ChunkMeta, modelHash string) error {
 	sortedChunks := make([]ChunkMeta, len(chunks))
 	copy(sortedChunks, chunks)
-
-	// Sort chunks by Index
 	sort.Slice(sortedChunks, func(i, j int) bool {
 		return sortedChunks[i].Index < sortedChunks[j].Index
 	})
 
-	// Verify chunk indices are contiguous starting from 0
-	for i, c := range sortedChunks {
+	tmp, err := os.CreateTemp(filepath.Dir(outputPath), "."+filepath.Base(outputPath)+".partial-*")
+	if err != nil {
+		return fmt.Errorf("create output: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // no-op once renamed
+
+	hasher := sha256.New()
+	if err := copyChunks(io.MultiWriter(tmp, hasher), chunkDir, sortedChunks); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync output: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close output: %w", err)
+	}
+
+	if got := "sha256:" + hex.EncodeToString(hasher.Sum(nil)); got != modelHash {
+		return fmt.Errorf("file hash mismatch: got %s, want %s", got, modelHash)
+	}
+
+	// CreateTemp uses 0600; give the final file the usual permissions.
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		return fmt.Errorf("chmod output: %w", err)
+	}
+	if err := os.Rename(tmpPath, outputPath); err != nil {
+		return fmt.Errorf("move output into place: %w", err)
+	}
+	return nil
+}
+
+func copyChunks(w io.Writer, chunkDir string, chunks []ChunkMeta) error {
+	for i, c := range chunks {
 		if c.Index != i {
 			return fmt.Errorf("invalid chunk layout: expected chunk index %d at position %d, got %d", i, i, c.Index)
 		}
 
-		chunkPath := filepath.Join(chunkDir, fmt.Sprintf("%d.chunk", c.Index))
-		cf, err := os.Open(chunkPath)
+		cf, err := os.Open(filepath.Join(chunkDir, fmt.Sprintf("%d.chunk", c.Index)))
 		if err != nil {
 			return fmt.Errorf("open chunk %d: %w", c.Index, err)
 		}
-		if _, err := io.Copy(out, cf); err != nil {
-			cf.Close()
+		_, err = io.Copy(w, cf)
+		cf.Close()
+		if err != nil {
 			return fmt.Errorf("write chunk %d: %w", c.Index, err)
 		}
-		cf.Close()
 	}
-
 	return nil
 }
