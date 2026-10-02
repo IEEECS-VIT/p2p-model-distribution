@@ -36,20 +36,79 @@ func TestProviderStoreConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-// TestProviderStoreCapsProvidersPerKey reproduces unauthenticated provider
-// announcements piling up without bound for a single popular key. Before
-// maxProvidersPerKey existed, an attacker announcing endless bogus provider
-// IDs for one key could grow that key's list forever.
+// TestProviderStoreCapsProvidersPerKey reproduces provider announcements
+// piling up without bound for a single popular key, and checks that a
+// flood of new providers cannot evict the ones already recorded.
 func TestProviderStoreCapsProvidersPerKey(t *testing.T) {
 	store := NewStore()
 
+	for i := 0; i < maxProvidersPerKey; i++ {
+		store.Add("popular", Node{ID: fmt.Sprintf("honest-%d", i), IP: "10.0.0.1"})
+	}
 	for i := 0; i < maxProvidersPerKey*3; i++ {
-		store.Add("popular-chunk", Node{ID: fmt.Sprintf("peer-%d", i)})
+		if store.Add("popular", Node{ID: fmt.Sprintf("flood-%d", i), IP: "10.0.0.2"}) {
+			t.Fatal("full key accepted a new provider")
+		}
 	}
 
-	got := len(store.Get("popular-chunk"))
-	if got != maxProvidersPerKey {
-		t.Fatalf("len(Get(...)) = %d, want %d (maxProvidersPerKey)", got, maxProvidersPerKey)
+	got := store.Get("popular")
+	if len(got) != maxProvidersPerKey {
+		t.Fatalf("len(Get(...)) = %d, want %d (maxProvidersPerKey)", len(got), maxProvidersPerKey)
+	}
+	for _, p := range got {
+		if p.ID[:6] != "honest" {
+			t.Fatalf("existing provider was evicted by %s", p.ID)
+		}
+	}
+
+	// Existing providers can still refresh.
+	if !store.Add("popular", Node{ID: "honest-0", IP: "10.0.0.1"}) {
+		t.Fatal("existing provider could not re-announce")
+	}
+}
+
+func TestProviderStoreLimitsProvidersPerPrefix(t *testing.T) {
+	store := NewStore()
+	for i := 0; i < maxProvidersPerPrefixPerKey; i++ {
+		if !store.Add("k", Node{ID: fmt.Sprintf("p%d", i), IP: fmt.Sprintf("198.51.100.%d", i+1)}) {
+			t.Fatalf("provider %d rejected", i)
+		}
+	}
+	if store.Add("k", Node{ID: "sybil", IP: "198.51.100.99"}) {
+		t.Fatal("accepted another provider from a full /24")
+	}
+	if !store.Add("k", Node{ID: "other", IP: "192.0.2.1"}) {
+		t.Fatal("rejected a provider from a different /24")
+	}
+}
+
+func TestProviderStoreLimitsKeysPerProvider(t *testing.T) {
+	store := NewStore()
+	p := Node{ID: "greedy", IP: "10.0.0.1"}
+	for i := 0; i < maxKeysPerProvider; i++ {
+		if !store.Add(fmt.Sprintf("key-%d", i), p) {
+			t.Fatalf("key %d rejected below the limit", i)
+		}
+	}
+	if store.Add("one-too-many", p) {
+		t.Fatal("provider exceeded maxKeysPerProvider")
+	}
+	store.Remove("key-0", "greedy")
+	if !store.Add("one-too-many", p) {
+		t.Fatal("freed slot was not reusable")
+	}
+}
+
+func TestProviderStoreSweepReleasesExpiredRecords(t *testing.T) {
+	store := newStoreWithTTL(10 * time.Millisecond)
+	p := Node{ID: "p", IP: "10.0.0.1"}
+	for i := 0; i < maxKeysPerProvider; i++ {
+		store.Add(fmt.Sprintf("key-%d", i), p)
+	}
+	time.Sleep(20 * time.Millisecond)
+	store.Sweep()
+	if !store.Add("fresh", p) {
+		t.Fatal("expired records still counted against the provider after Sweep")
 	}
 }
 
