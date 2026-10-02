@@ -354,24 +354,9 @@ func (s *Service) sendDHTRequest(ctx context.Context, conn *network.Connection, 
 		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
 
-	// Update connection mapping with the peer's resolved ID
-	if resp.FromID != "" {
-		s.mu.Lock()
-		// Remove old addr-based or different ID-based key for the same connection
-		for k, v := range s.conns {
-			if v == conn && k != resp.FromID {
-				delete(s.conns, k)
-				break
-			}
-		}
-		s.conns[resp.FromID] = conn
-		s.addrs[resp.FromID] = conn.RemoteAddr().String()
-		s.mu.Unlock()
-
-		if resp.FromIP != "" && resp.FromPort != 0 {
-			s.dht.AddPeer(Node{ID: resp.FromID, IP: resp.FromIP, Port: resp.FromPort})
-		}
-	}
+	// The responder's identity comes from the TLS handshake, never from
+	// self-reported fields in the message body.
+	s.trackPeer(conn, resp.FromPort)
 
 	return resp, nil
 }
@@ -392,29 +377,15 @@ func (s *Service) handleDHTMessage(conn *network.Connection, env *protocol.Envel
 		return fmt.Errorf("unmarshal DHT message: %w", err)
 	}
 
-	// Convert wire format to dht.Message.
+	// The sender's identity comes from the TLS handshake, never from
+	// self-reported fields in the message body.
 	req := Message{
 		Type:     body.Type,
 		TargetID: body.TargetID,
 		Key:      body.Key,
 		Value:    body.Value,
-		From:     s.resolvePeer(body, conn),
+		From:     s.trackPeer(conn, body.FromPort),
 		To:       s.self,
-	}
-
-	// Update connection map: key by peer ID so FindProviders can find them.
-	if body.FromID != "" {
-		s.mu.Lock()
-		// Remove old addr-based key
-		for k, v := range s.conns {
-			if v == conn && k != body.FromID {
-				delete(s.conns, k)
-				break
-			}
-		}
-		s.conns[body.FromID] = conn
-		s.addrs[body.FromID] = conn.RemoteAddr().String()
-		s.mu.Unlock()
 	}
 
 	// Let the DHT core process it.
@@ -447,35 +418,30 @@ func (s *Service) handleDHTMessage(conn *network.Connection, env *protocol.Envel
 	return conn.WriteRawResponse(env.Id, respType, respPayload)
 }
 
-// resolvePeer maps a FromID from a wire message to a dht.Node.
-// If we don't have the peer in our routing table, we extract
-// address info from the connection and add it.
-func (s *Service) resolvePeer(body *protocol.DHTMessageBody, conn *network.Connection) Node {
-	fromID := body.FromID
-	// Check routing table first.
-	if p, ok := s.dht.RoutingTable.FindNode(fromID); ok {
-		if body.FromPort != 0 && p.Port != body.FromPort {
-			p.Port = body.FromPort
-			s.dht.AddPeer(p)
+// trackPeer records conn under the peer's authenticated node ID and adds
+// the peer to the routing table. The peer's address is the IP observed on
+// the socket plus the listen port it advertises (the only self-reported
+// field we use): trusting a self-reported IP would let a peer point other
+// nodes at arbitrary third-party hosts.
+func (s *Service) trackPeer(conn *network.Connection, listenPort int) Node {
+	peerID := conn.PeerID()
+
+	s.mu.Lock()
+	for k, v := range s.conns {
+		if v == conn && k != peerID {
+			delete(s.conns, k)
+			break
 		}
-		return p
 	}
+	s.conns[peerID] = conn
+	s.mu.Unlock()
 
-	// Unknown peer — add it with the connection's remote address.
-	addr := conn.RemoteAddr().String()
-	ip, portStr := splitHostPort(addr)
-	port := 0
-	_, _ = fmt.Sscanf(portStr, "%d", &port)
-
-	if body.FromIP != "" {
-		ip = body.FromIP
+	ip, _ := splitHostPort(conn.RemoteAddr().String())
+	node := Node{ID: peerID, IP: ip, Port: listenPort}
+	if listenPort > 0 && listenPort <= 65535 {
+		s.dht.AddPeer(node)
+		s.AddPeerAddr(peerID, node.Endpoint())
 	}
-	if body.FromPort != 0 {
-		port = body.FromPort
-	}
-
-	node := Node{ID: fromID, IP: ip, Port: port}
-	s.dht.AddPeer(node)
 	return node
 }
 
