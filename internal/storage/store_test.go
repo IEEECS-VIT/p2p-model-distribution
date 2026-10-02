@@ -128,3 +128,28 @@ func TestStoreModelIsContentAddressed(t *testing.T) {
 		t.Fatalf("staging dir not cleaned up: %d entries", len(entries))
 	}
 }
+
+func TestCompleteFilesSkipsPartialDownloads(t *testing.T) {
+	tempDir := t.TempDir()
+	store := NewStore(filepath.Join(tempDir, "store"))
+	src := filepath.Join(tempDir, "model.bin")
+	if err := os.WriteFile(src, bytes.Repeat([]byte("x"), 5000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := store.StoreModel(src, filemeta.MinChunkSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A partial download: chunks but no manifest.
+	if err := store.WriteChunk("aaaa", 0, []byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err := store.CompleteFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != meta.FileID {
+		t.Fatalf("CompleteFiles = %v, want [%s]", ids, meta.FileID)
+	}
+}

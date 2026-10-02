@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -184,6 +185,26 @@ func (s *Store) HasCompleteFile(fileID string) bool {
 		return false
 	}
 	return meta.VerifyID(fileID) == nil
+}
+
+// CompleteFiles returns the IDs of every complete file in the store.
+// Partial downloads, the staging area and anything else in the base
+// directory are skipped.
+func (s *Store) CompleteFiles() ([]string, error) {
+	entries, err := os.ReadDir(s.layout.BaseDir())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, e := range entries {
+		if e.IsDir() && ValidFileID(e.Name()) && s.HasCompleteFile(e.Name()) {
+			ids = append(ids, e.Name())
+		}
+	}
+	return ids, nil
 }
 
 // writeFileAtomic writes data to path via a synced temporary file and a
