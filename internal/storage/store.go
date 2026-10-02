@@ -10,7 +10,7 @@ import (
 )
 
 // Store handles the file system storage layout, writes chunk files,
-// and saves/loads manifests and state files.
+// and saves/loads manifests.
 type Store struct {
 	layout *Layout
 }

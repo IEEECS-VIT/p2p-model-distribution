@@ -232,13 +232,25 @@ func (d *Downloader) downloadChunks(ctx context.Context, meta filemeta.FileMeta)
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
-	jobs := make(chan int, meta.NumChunks)
-	for i := 0; i < meta.NumChunks; i++ {
+	// Resume: chunks left on disk by an interrupted download are kept if
+	// they still match the manifest; only missing or corrupt ones are
+	// fetched (corrupt files are overwritten).
+	needed := filemeta.VerifyAllChunks(d.store.Layout().ChunksDir(d.fileID), meta.Chunks)
+	if have := meta.NumChunks - len(needed); have > 0 {
+		slog.Info("resuming download", "verified_chunks", have, "remaining", len(needed))
+		if d.opts.Progress != nil {
+			d.opts.Progress(have, meta.NumChunks)
+		}
+	}
+
+	jobs := make(chan int, len(needed))
+	for _, i := range needed {
 		jobs <- i
 	}
 	close(jobs)
 
 	var done atomic.Int32
+	done.Store(int32(meta.NumChunks - len(needed)))
 	var wg sync.WaitGroup
 	for w := 0; w < d.opts.Concurrency; w++ {
 		wg.Add(1)

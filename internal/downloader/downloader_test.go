@@ -256,3 +256,43 @@ func TestDownloader_RejectsInvalidFileID(t *testing.T) {
 		t.Fatal("download accepted an invalid file ID")
 	}
 }
+
+// TestDownloader_ResumesFromVerifiedChunks simulates an interrupted
+// download: some chunks are already on disk (one of them corrupted).
+// Only the missing and corrupt chunks may be requested again.
+func TestDownloader_ResumesFromVerifiedChunks(t *testing.T) {
+	data := testData(10 * 4 * 1024)
+	store, meta := seedFile(t, data, 4*1024)
+	s := &seeder{store: store}
+	addr := s.start(t)
+
+	dlStore := storage.NewStore(t.TempDir())
+	for _, i := range []int{0, 2, 4, 6, 8} {
+		chunk, err := store.ReadChunk(meta.FileID, i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 8 {
+			chunk = bytes.Repeat([]byte{0}, len(chunk)) // corrupt
+		}
+		if err := dlStore.WriteChunk(meta.FileID, i, chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	dl := New(meta.FileID, dlStore, newNode(t), Options{Providers: []string{addr}})
+	if _, err := dl.Download(ctx, dest); err != nil {
+		t.Fatalf("download failed: %v", err)
+	}
+
+	if got, want := int(s.chunkRequests.Load()), 6; got != want {
+		t.Fatalf("requested %d chunks, want %d (5 missing + 1 corrupt)", got, want)
+	}
+	got, _ := os.ReadFile(dest)
+	if !bytes.Equal(got, data) {
+		t.Fatal("resumed download differs from original")
+	}
+}

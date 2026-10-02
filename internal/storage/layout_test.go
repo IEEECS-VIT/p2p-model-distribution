@@ -13,7 +13,6 @@ func TestLayoutPaths(t *testing.T) {
 		wantFile     string
 		wantChunk    string
 		wantManifest string
-		wantState    string
 	}{
 		{
 			name:         "DefaultBaseDir",
@@ -22,7 +21,6 @@ func TestLayoutPaths(t *testing.T) {
 			wantFile:     filepath.Join(DefaultBaseDir, "file-123"),
 			wantChunk:    filepath.Join(DefaultBaseDir, "file-123", "chunks"),
 			wantManifest: filepath.Join(DefaultBaseDir, "file-123", "manifest.json"),
-			wantState:    filepath.Join(DefaultBaseDir, "file-123", "state.json"),
 		},
 		{
 			name:         "CustomBaseDir",
@@ -31,7 +29,6 @@ func TestLayoutPaths(t *testing.T) {
 			wantFile:     filepath.Join("custom/path", "file-456"),
 			wantChunk:    filepath.Join("custom/path", "file-456", "chunks"),
 			wantManifest: filepath.Join("custom/path", "file-456", "manifest.json"),
-			wantState:    filepath.Join("custom/path", "file-456", "state.json"),
 		},
 	}
 
@@ -46,9 +43,6 @@ func TestLayoutPaths(t *testing.T) {
 			}
 			if got := l.ManifestPath(tt.fileID); got != tt.wantManifest {
 				t.Errorf("ManifestPath() = %q, want %q", got, tt.wantManifest)
-			}
-			if got := l.StatePath(tt.fileID); got != tt.wantState {
-				t.Errorf("StatePath() = %q, want %q", got, tt.wantState)
 			}
 		})
 	}

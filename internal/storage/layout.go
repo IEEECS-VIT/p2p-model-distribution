@@ -43,7 +43,7 @@ func ValidFileID(id string) bool {
 	return true
 }
 
-// Layout defines the paths for storing files, chunks, manifests, and state files.
+// Layout defines the paths for storing files, chunks and manifests.
 type Layout struct {
 	baseDir string
 }
@@ -76,9 +76,4 @@ func (l *Layout) ChunksDir(fileID string) string {
 // ManifestPath returns the path to the manifest.json file for a specific fileID.
 func (l *Layout) ManifestPath(fileID string) string {
 	return filepath.Join(l.FileDir(fileID), "manifest.json")
-}
-
-// StatePath returns the path to the state.json file for a specific fileID.
-func (l *Layout) StatePath(fileID string) string {
-	return filepath.Join(l.FileDir(fileID), "state.json")
 }

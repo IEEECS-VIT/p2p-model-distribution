@@ -112,11 +112,3 @@ func (m FileMeta) VerifyID(id string) error {
 	}
 	return nil
 }
-
-type DownloadState struct {
-	FileID     string          `json:"file_id"`
-	Status     string          `json:"status"`
-	Downloaded map[string]bool `json:"downloaded"`
-	Verified   map[string]bool `json:"verified"`
-	UpdatedAt  int64           `json:"updated_at"`
-}
