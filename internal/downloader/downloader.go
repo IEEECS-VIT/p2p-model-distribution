@@ -248,6 +248,17 @@ func (d *Downloader) downloadManifest(ctx context.Context) (filemeta.FileMeta, e
 			continue
 		}
 
+		// The file ID is the manifest CID, so this is what authenticates
+		// the manifest (and every hash inside it) against what the user
+		// asked for. Without it a malicious provider could serve any
+		// content with self-consistent hashes.
+		if err := meta.VerifyID(d.fileID); err != nil {
+			lastErr = fmt.Errorf("provider sent a manifest for different content: %w", err)
+			d.markProviderFailed(addr, lastErr)
+			continue
+		}
+		meta.FileID = d.fileID
+
 		// Reset failure count on success
 		d.mu.Lock()
 		d.providerFailures[addr] = 0
@@ -330,6 +341,12 @@ func (d *Downloader) worker(ctx context.Context, jobs <-chan int, errChan chan<-
 			}
 
 			// Verify chunk integrity
+			if len(chunkResp.Data) != chunkMeta.Size {
+				err := fmt.Errorf("chunk %d has %d bytes, want %d", chunkIdx, len(chunkResp.Data), chunkMeta.Size)
+				d.markProviderFailed(addr, err)
+				lastErr = err
+				continue
+			}
 			if err := filemeta.VerifyChunk(chunkResp.Data, chunkMeta.Hash); err != nil {
 				err := fmt.Errorf("chunk hash mismatch: %w", err)
 				d.markProviderFailed(addr, err)

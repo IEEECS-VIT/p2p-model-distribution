@@ -231,3 +231,65 @@ func TestDownloader_FailoverAndRetry(t *testing.T) {
 		t.Errorf("size mismatch: expected %d, got %d", len(dummyData), len(downloadedData))
 	}
 }
+
+// TestDownloader_RejectsSubstitutedManifest simulates a malicious provider
+// that answers every metadata request with a manifest for content of its
+// choosing. The manifest is internally consistent (its chunk hashes match
+// the chunks it serves), so only the CID check can catch it.
+func TestDownloader_RejectsSubstitutedManifest(t *testing.T) {
+	tempDir := t.TempDir()
+
+	writeFile := func(name string, data []byte) string {
+		p := filepath.Join(tempDir, name)
+		if err := os.WriteFile(p, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	evilStore := storage.NewStore(filepath.Join(tempDir, "evil"))
+	evil, err := evilStore.StoreModel(writeFile("evil.bin", []byte("malicious weights")), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wanted, err := storage.NewStore(filepath.Join(tempDir, "genuine")).StoreModel(writeFile("genuine.bin", []byte("genuine weights")), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := network.NewServer("127.0.0.1:0")
+	router := network.NewRouter()
+	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
+		mBytes, _ := json.Marshal(evil)
+		resp := &protocol.GetMetadataResponse{FileId: wanted.FileID, Success: true, MetadataJson: mBytes}
+		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
+	})
+	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
+		var req protocol.GetChunkRequest
+		_ = proto.Unmarshal(env.Payload, &req)
+		data, _ := evilStore.ReadChunk(evil.FileID, int(req.ChunkIndex))
+		resp := &protocol.GetChunkResponse{FileId: req.FileId, ChunkIndex: req.ChunkIndex, Success: true, Data: data}
+		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
+	})
+	server.OnNewConnection = func(conn *network.Connection) {
+		conn.SetRouter(router)
+		conn.Start()
+	}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Stop()
+
+	dlDir := filepath.Join(tempDir, "dl")
+	dl := New(wanted.FileID, dlDir, nil, storage.NewStore(dlDir), []string{server.Addr().String()}, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	destPath := filepath.Join(tempDir, "out.bin")
+	if _, err := dl.Download(ctx, destPath); err == nil {
+		t.Fatal("download succeeded with a substituted manifest")
+	}
+	if _, err := os.Stat(destPath); !os.IsNotExist(err) {
+		t.Fatalf("output file was created despite rejected manifest (stat err = %v)", err)
+	}
+}
