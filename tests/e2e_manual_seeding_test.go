@@ -226,6 +226,7 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 		downloaderStore.Layout().ChunksDir(fileID),
 		assembledPath,
 		downloadedMeta.Chunks,
+		downloadedMeta.ModelHash,
 	); err != nil {
 		t.Fatalf("failed to reassemble chunks: %v", err)
 	}

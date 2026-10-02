@@ -181,14 +181,10 @@ func (d *Downloader) Download(ctx context.Context, outPath string) (filemeta.Fil
 	fmt.Printf("%s[DOWNLOAD]%s Reassembling chunks into target destination: %s%s%s...\n",
 		colorBlue, colorReset, colorBold, outPath, colorReset)
 
-	if err := filemeta.AssembleChunks(d.store.Layout().ChunksDir(d.fileID), outPath, meta.Chunks); err != nil {
+	// AssembleChunks verifies the whole-file hash before moving the
+	// output into place, so outPath never holds an unverified file.
+	if err := filemeta.AssembleChunks(d.store.Layout().ChunksDir(d.fileID), outPath, meta.Chunks, meta.ModelHash); err != nil {
 		return filemeta.FileMeta{}, fmt.Errorf("reassembly failed: %w", err)
-	}
-
-	// 6. Final verification
-	fmt.Printf("%s[DOWNLOAD]%s Running final file SHA-256 validation...\n", colorBlue, colorReset)
-	if err := filemeta.VerifyFile(outPath, meta.ModelHash); err != nil {
-		return filemeta.FileMeta{}, fmt.Errorf("final file integrity check failed: %w", err)
 	}
 
 	fmt.Printf("%s[DOWNLOAD]%s %s★ SUCCESS! File reassembled and hash verified cleanly ★%s\n",
