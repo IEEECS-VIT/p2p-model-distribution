@@ -2,13 +2,13 @@ package dht
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
 	"log"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/identity"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
 )
@@ -18,6 +18,7 @@ import (
 // announcement/lookup, and wires DHT message handlers into the
 // network router so that every node can participate in the DHT.
 type Service struct {
+	id       *identity.Identity
 	self     Node
 	dht      *DHT
 	server   *network.Server
@@ -35,23 +36,19 @@ type Service struct {
 }
 
 // NewService creates a DHT service.
-//   - nodeID:   optional; if empty, a random 8-byte hex ID is generated
+//   - id:       the node's identity; the node ID is derived from its key
 //   - listen:   TCP address to listen on, e.g. "0.0.0.0:9000"
 //   - external: address we advertise in the DHT, e.g. "192.168.1.5:9000" (empty = auto-detect)
 //   - seeds:    bootstrap peer addresses ("ip:port")
-func NewService(nodeID, listen, external string, seeds []string) *Service {
-	if nodeID == "" {
-		b := make([]byte, 8)
-		_, _ = rand.Read(b)
-		nodeID = fmt.Sprintf("%x", b)
-	}
-	self := Node{ID: nodeID, IP: extractIP(external, listen), Port: extractPort(external, listen)}
+func NewService(id *identity.Identity, listen, external string, seeds []string) *Service {
+	self := Node{ID: id.ID(), IP: extractIP(external, listen), Port: extractPort(external, listen)}
 
 	d := NewDHT(self)
 	router := network.NewRouter()
-	srv := network.NewServer(listen)
+	srv := network.NewServer(listen, id.ServerTLSConfig())
 
 	return &Service{
+		id:        id,
 		self:      self,
 		dht:       d,
 		server:    srv,
@@ -325,11 +322,10 @@ func (s *Service) GetConnection(addr string) (*network.Connection, error) {
 	}
 	s.mu.RUnlock()
 
-	raw, err := net.Dial("tcp", addr)
+	conn, err := network.Dial(context.Background(), addr, s.id.ClientTLSConfig(""))
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", addr, err)
+		return nil, err
 	}
-	conn := network.NewConnection(raw, addr)
 	conn.SetRouter(s.router)
 	conn.Start()
 

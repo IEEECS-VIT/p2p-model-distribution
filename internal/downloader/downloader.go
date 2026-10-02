@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -33,6 +34,7 @@ const (
 
 type Downloader struct {
 	fileID           string
+	tlsConfig        *tls.Config
 	dataDir          string
 	svc              *dht.Service
 	store            *storage.Store
@@ -45,12 +47,15 @@ type Downloader struct {
 	connections      map[string]*network.Connection // active connections dialed locally (when svc == nil)
 }
 
-func New(fileID string, dataDir string, svc *dht.Service, store *storage.Store, initialProviders []string, concurrency int) *Downloader {
+// New creates a Downloader. tlsConfig is used to dial providers directly
+// when svc is nil.
+func New(fileID string, dataDir string, svc *dht.Service, store *storage.Store, initialProviders []string, concurrency int, tlsConfig *tls.Config) *Downloader {
 	if concurrency <= 0 {
 		concurrency = 4
 	}
 	return &Downloader{
 		fileID:           fileID,
+		tlsConfig:        tlsConfig,
 		dataDir:          dataDir,
 		svc:              svc,
 		store:            store,
@@ -454,12 +459,12 @@ func (d *Downloader) getConnection(addr string) (*network.Connection, error) {
 		return conn, nil
 	}
 
-	rawConn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	// Any peer may serve the file: the manifest is authenticated by its
+	// CID, so the provider's identity does not need to be pinned here.
+	conn, err := network.Dial(context.Background(), addr, d.tlsConfig)
 	if err != nil {
 		return nil, err
 	}
-
-	conn := network.NewConnection(rawConn, addr)
 	conn.Start()
 	d.connections[addr] = conn
 	return conn, nil

@@ -46,10 +46,10 @@ func TestFraming_RejectsOversizedFrames(t *testing.T) {
 }
 
 // startRawPeer returns a server-side Connection (with router) and the raw
-// client socket talking to it, so tests can inject arbitrary bytes.
+// client TLS socket talking to it, so tests can inject arbitrary frames.
 func startRawPeer(t *testing.T, router *Router) (*Connection, net.Conn) {
 	t.Helper()
-	server := NewServer("127.0.0.1:0")
+	server, _ := newTestServer(t)
 	accepted := make(chan *Connection, 1)
 	server.OnNewConnection = func(conn *Connection) {
 		conn.SetRouter(router)
@@ -61,11 +61,7 @@ func startRawPeer(t *testing.T, router *Router) (*Connection, net.Conn) {
 	}
 	t.Cleanup(server.Stop)
 
-	raw, err := net.Dial("tcp", server.Addr().String())
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	t.Cleanup(func() { raw.Close() })
+	raw := dialRawTLS(t, server.Addr().String())
 
 	select {
 	case c := <-accepted:
@@ -159,7 +155,7 @@ func TestConnection_PendingRequestsFailWhenConnectionCloses(t *testing.T) {
 
 func TestConnection_RPCRoundtrip(t *testing.T) {
 	// Start server on an ephemeral port
-	server := NewServer("127.0.0.1:0")
+	server, _ := newTestServer(t)
 
 	// Set up router on server side
 	router := NewRouter()
@@ -202,14 +198,7 @@ func TestConnection_RPCRoundtrip(t *testing.T) {
 	defer server.Stop()
 
 	// Connect client
-	addr := server.listener.Addr().String()
-	rawConn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("failed to connect to server: %v", err)
-	}
-	defer rawConn.Close()
-
-	clientConn := NewConnection(rawConn, "client-node")
+	clientConn := dialTest(t, server.Addr().String())
 	clientConn.Start()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

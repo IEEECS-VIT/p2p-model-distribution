@@ -8,12 +8,14 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/dht"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/downloader"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/identity"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
@@ -46,18 +48,22 @@ func main() {
 	// DHT flags
 	dhtEnable := flag.Bool("dht", false, "enable DHT peer discovery")
 	dhtBootstrap := flag.String("dht-bootstrap", "", "comma-separated bootstrap peer addresses (ip:port)")
-	dhtNodeID := flag.String("dht-node-id", "", "node ID (random if empty)")
 	dhtExternal := flag.String("dht-external", "", "external address advertised to peers (ip:port)")
 
 	flag.Parse()
 
 	printHeader()
 
+	id, err := identity.LoadOrCreate(filepath.Join(*dataDir, "node.key"))
+	if err != nil {
+		log.Fatalf("failed to load node identity: %v", err)
+	}
+
 	if *dhtEnable {
-		runWithDHT(*mode, *port, *file, *dataDir, *chunkSizeKB*1024,
-			*addr, *fileID, *outPath, *dhtNodeID, *dhtExternal, *dhtBootstrap)
+		runWithDHT(id, *mode, *port, *file, *dataDir, *chunkSizeKB*1024,
+			*addr, *fileID, *outPath, *dhtExternal, *dhtBootstrap)
 	} else {
-		runLegacy(*mode, *port, *file, *dataDir, *chunkSizeKB*1024,
+		runLegacy(id, *mode, *port, *file, *dataDir, *chunkSizeKB*1024,
 			*addr, *fileID, *outPath)
 	}
 }
@@ -65,16 +71,16 @@ func main() {
 //---------------------------------------------------------------------
 // Legacy (non-DHT) mode — original behaviour.
 
-func runLegacy(mode, port, filePath, dataDir string, chunkSize int, addr, fileID, outPath string) {
+func runLegacy(id *identity.Identity, mode, port, filePath, dataDir string, chunkSize int, addr, fileID, outPath string) {
 	if mode == "seed" {
-		runSeeder(port, filePath, dataDir, chunkSize)
+		runSeeder(id, port, filePath, dataDir, chunkSize)
 	} else if mode == "download" {
 		if addr == "" || fileID == "" {
 			fmt.Printf("%s[ERROR]%s -addr and -file-id are required for download mode\n", colorRed, colorReset)
 			flag.Usage()
 			os.Exit(1)
 		}
-		runDownloader(addr, fileID, dataDir, outPath)
+		runDownloader(id, addr, fileID, dataDir, outPath)
 	} else {
 		fmt.Printf("%s[ERROR]%s invalid mode '%s'. Choose 'seed' or 'download'\n", colorRed, colorReset, mode)
 		os.Exit(1)
@@ -84,8 +90,8 @@ func runLegacy(mode, port, filePath, dataDir string, chunkSize int, addr, fileID
 //---------------------------------------------------------------------
 // DHT-enabled mode.
 
-func runWithDHT(mode, port, filePath, dataDir string, chunkSize int,
-	addr, fileID, outPath, nodeID, external, bootstrapCSV string) {
+func runWithDHT(id *identity.Identity, mode, port, filePath, dataDir string, chunkSize int,
+	addr, fileID, outPath, external, bootstrapCSV string) {
 
 	listenAddr := "0.0.0.0:" + port
 	var seeds []string
@@ -99,7 +105,7 @@ func runWithDHT(mode, port, filePath, dataDir string, chunkSize int,
 	}
 
 	// Create the DHT service.
-	svc := dht.NewService(nodeID, listenAddr, external, seeds)
+	svc := dht.NewService(id, listenAddr, external, seeds)
 	store := storage.NewStore(dataDir)
 
 	// Register file-transfer handlers on the DHT service's router.
@@ -354,7 +360,7 @@ func runDHDownloader(ctx context.Context, fileID, outPath, dataDir string, svc *
 foundProviders:
 	fmt.Printf("%s[DHT]%s Found %d initial provider(s)\n", colorGreen, colorReset, len(providers))
 
-	dl := downloader.New(fileID, dataDir, svc, store, providers, 4)
+	dl := downloader.New(fileID, dataDir, svc, store, providers, 4, nil)
 	_, err := dl.Download(dlCtx, outPath)
 	if err != nil {
 		log.Fatalf("download failed: %v", err)
@@ -364,7 +370,7 @@ foundProviders:
 //---------------------------------------------------------------------
 // Legacy seeder (no DHT)
 
-func runSeeder(port, filePath, dataDir string, chunkSize int) {
+func runSeeder(id *identity.Identity, port, filePath, dataDir string, chunkSize int) {
 	store := storage.NewStore(dataDir)
 
 	if filePath != "" {
@@ -387,7 +393,7 @@ func runSeeder(port, filePath, dataDir string, chunkSize int) {
 	}
 
 	listenAddr := "0.0.0.0:" + port
-	server := network.NewServer(listenAddr)
+	server := network.NewServer(listenAddr, id.ServerTLSConfig())
 	router := network.NewRouter()
 
 	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
@@ -471,12 +477,12 @@ func runSeeder(port, filePath, dataDir string, chunkSize int) {
 //---------------------------------------------------------------------
 // Legacy downloader (no DHT)
 
-func runDownloader(seederAddr, fileID, dataDir, outPath string) {
+func runDownloader(id *identity.Identity, seederAddr, fileID, dataDir, outPath string) {
 	store := storage.NewStore(dataDir)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	dl := downloader.New(fileID, dataDir, nil, store, []string{seederAddr}, 4)
+	dl := downloader.New(fileID, dataDir, nil, store, []string{seederAddr}, 4, id.ClientTLSConfig(""))
 	_, err := dl.Download(ctx, outPath)
 	if err != nil {
 		log.Fatalf("download failed: %v", err)

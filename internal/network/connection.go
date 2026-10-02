@@ -51,9 +51,8 @@ type Connection struct {
 	// mu protects pendingRequests, router and onClose.
 	mu sync.Mutex
 
-	// peerID is the logical identifier of the remote node.
-	// In a real P2P system, this is populated during a cryptographic
-	// handshake. For now, it will default to the IP address.
+	// peerID is the remote node's ID. For connections created by Server
+	// or Dial it is authenticated by the mutual TLS handshake.
 	peerID string
 
 	connectedAt time.Time

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,11 +12,21 @@ import (
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/dht"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/downloader"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/filemeta"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/identity"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
 	"google.golang.org/protobuf/proto"
 )
+
+func newIdentity(t *testing.T) *identity.Identity {
+	t.Helper()
+	id, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("identity.Generate: %v", err)
+	}
+	return id
+}
 
 func TestEndToEnd_P2PDistribution(t *testing.T) {
 	// 1. Prepare temporary workspaces for Seeder and Downloader nodes
@@ -49,7 +58,7 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 	}
 
 	// 3. Start Seeder TCP Server and register RPC handlers
-	seederServer := network.NewServer("127.0.0.1:0")
+	seederServer := network.NewServer("127.0.0.1:0", newIdentity(t).ServerTLSConfig())
 	router := network.NewRouter()
 
 	// Handle GetMetadata RPC
@@ -127,13 +136,11 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 
 	// 4. Downloader Node Setup: Connect to Seeder and run RPC download loop
 	seederAddr := seederServer.Addr().String()
-	rawConn, err := net.Dial("tcp", seederAddr)
+	downloaderConn, err := network.Dial(context.Background(), seederAddr, newIdentity(t).ClientTLSConfig(""))
 	if err != nil {
 		t.Fatalf("failed to dial seeder node: %v", err)
 	}
-	defer rawConn.Close()
-
-	downloaderConn := network.NewConnection(rawConn, "downloader-node")
+	defer downloaderConn.Close()
 	downloaderConn.Start()
 
 	downloaderStore := storage.NewStore(downloaderDir)
@@ -264,7 +271,7 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 	}
 
 	// 2. Start Bootstrap Node
-	bootstrapSvc := dht.NewService("bootstrap-node", "127.0.0.1:0", "", nil)
+	bootstrapSvc := dht.NewService(newIdentity(t), "127.0.0.1:0", "", nil)
 	if err := bootstrapSvc.Start(); err != nil {
 		t.Fatalf("failed to start bootstrap service: %v", err)
 	}
@@ -279,7 +286,7 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 		t.Fatalf("failed to store model on seeder: %v", err)
 	}
 
-	seederSvc := dht.NewService("seeder-node", "127.0.0.1:0", "", []string{bootstrapAddr})
+	seederSvc := dht.NewService(newIdentity(t), "127.0.0.1:0", "", []string{bootstrapAddr})
 
 	// Register file transfer handlers on seeder DHT router
 	seederRouter := seederSvc.Router()
@@ -312,7 +319,7 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 
 	// 4. Start Downloader Node
 	downloaderStore := storage.NewStore(downloaderDir)
-	downloaderSvc := dht.NewService("downloader-node", "127.0.0.1:0", "", []string{bootstrapAddr})
+	downloaderSvc := dht.NewService(newIdentity(t), "127.0.0.1:0", "", []string{bootstrapAddr})
 	if err := downloaderSvc.Start(); err != nil {
 		t.Fatalf("failed to start downloader service: %v", err)
 	}
@@ -322,7 +329,7 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// 5. Run Downloader with DHT fallback enabled (passing nil initialProviders)
-	dl := downloader.New(fileID, downloaderDir, downloaderSvc, downloaderStore, nil, 2)
+	dl := downloader.New(fileID, downloaderDir, downloaderSvc, downloaderStore, nil, 2, nil)
 
 	assembledPath := filepath.Join(downloaderDir, "dht-assembled.bin")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

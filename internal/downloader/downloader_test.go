@@ -8,11 +8,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/identity"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
 	"google.golang.org/protobuf/proto"
 )
+
+func newIdentity(t *testing.T) *identity.Identity {
+	t.Helper()
+	id, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("identity.Generate: %v", err)
+	}
+	return id
+}
 
 func TestDownloader_HappyPathParallel(t *testing.T) {
 	// 1. Directories setup
@@ -46,7 +56,7 @@ func TestDownloader_HappyPathParallel(t *testing.T) {
 	}
 
 	// 4. Start Seeder TCP Server
-	seederServer := network.NewServer("127.0.0.1:0")
+	seederServer := network.NewServer("127.0.0.1:0", newIdentity(t).ServerTLSConfig())
 	router := network.NewRouter()
 
 	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
@@ -96,7 +106,7 @@ func TestDownloader_HappyPathParallel(t *testing.T) {
 
 	// 5. Run parallel downloader
 	dlStore := storage.NewStore(downloaderDir)
-	dl := New(fileID, downloaderDir, nil, dlStore, []string{seederAddr}, 4)
+	dl := New(fileID, downloaderDir, nil, dlStore, []string{seederAddr}, 4, newIdentity(t).ClientTLSConfig(""))
 
 	destPath := filepath.Join(tempDir, "assembled.model")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -155,7 +165,7 @@ func TestDownloader_FailoverAndRetry(t *testing.T) {
 	}
 
 	// 4. Start Healthy Seeder TCP Server
-	healthyServer := network.NewServer("127.0.0.1:0")
+	healthyServer := network.NewServer("127.0.0.1:0", newIdentity(t).ServerTLSConfig())
 	router := network.NewRouter()
 
 	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
@@ -181,7 +191,7 @@ func TestDownloader_FailoverAndRetry(t *testing.T) {
 	defer healthyServer.Stop()
 
 	// 5. Start Broken Seeder TCP Server (closes connection or returns errors)
-	brokenServer := network.NewServer("127.0.0.1:0")
+	brokenServer := network.NewServer("127.0.0.1:0", newIdentity(t).ServerTLSConfig())
 	brokenRouter := network.NewRouter()
 
 	brokenRouter.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
@@ -210,7 +220,7 @@ func TestDownloader_FailoverAndRetry(t *testing.T) {
 	// 6. Downloader Setup with both seeder addresses
 	dlStore := storage.NewStore(downloaderDir)
 	// We put the broken server address first so the downloader hits it initially, fails, and recovers
-	dl := New(fileID, downloaderDir, nil, dlStore, []string{brokenAddr, healthyAddr}, 2)
+	dl := New(fileID, downloaderDir, nil, dlStore, []string{brokenAddr, healthyAddr}, 2, newIdentity(t).ClientTLSConfig(""))
 
 	destPath := filepath.Join(tempDir, "assembled_failover.model")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -257,7 +267,7 @@ func TestDownloader_RejectsSubstitutedManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	server := network.NewServer("127.0.0.1:0")
+	server := network.NewServer("127.0.0.1:0", newIdentity(t).ServerTLSConfig())
 	router := network.NewRouter()
 	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
 		mBytes, _ := json.Marshal(evil)
@@ -281,7 +291,7 @@ func TestDownloader_RejectsSubstitutedManifest(t *testing.T) {
 	defer server.Stop()
 
 	dlDir := filepath.Join(tempDir, "dl")
-	dl := New(wanted.FileID, dlDir, nil, storage.NewStore(dlDir), []string{server.Addr().String()}, 2)
+	dl := New(wanted.FileID, dlDir, nil, storage.NewStore(dlDir), []string{server.Addr().String()}, 2, newIdentity(t).ClientTLSConfig(""))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
