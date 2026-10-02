@@ -1,0 +1,10 @@
+data-test/
+*.txt
+data/
+downloaded_model.bin
+bin/
+downloader-data/
+seeder-data/
+assests/
+node-data/
+/node
