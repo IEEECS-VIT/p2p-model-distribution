@@ -16,6 +16,7 @@ import (
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/transfer"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -61,68 +62,7 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 	seederServer := network.NewServer("127.0.0.1:0", newIdentity(t).ServerTLSConfig())
 	router := network.NewRouter()
 
-	// Handle GetMetadata RPC
-	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetMetadataRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-
-		// Load manifest from storage
-		meta, err := seederStore.LoadManifest(req.FileId)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   err.Error(),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-
-		manifestBytes, err := json.Marshal(meta)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   err.Error(),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-
-		resp := &protocol.GetMetadataResponse{
-			FileId:       req.FileId,
-			Success:      true,
-			MetadataJson: manifestBytes,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-	})
-
-	// Handle GetChunk RPC
-	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetChunkRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-
-		chunkData, err := seederStore.ReadChunk(req.FileId, int(req.ChunkIndex))
-		if err != nil {
-			resp := &protocol.GetChunkResponse{
-				FileId:     req.FileId,
-				ChunkIndex: req.ChunkIndex,
-				Success:    false,
-				Error:      err.Error(),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-		}
-
-		resp := &protocol.GetChunkResponse{
-			FileId:     req.FileId,
-			ChunkIndex: req.ChunkIndex,
-			Success:    true,
-			Data:       chunkData,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-	})
+	transfer.NewServer(seederStore).Register(router)
 
 	seederServer.OnNewConnection = func(conn *network.Connection) {
 		conn.SetRouter(router)
@@ -288,23 +228,7 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 
 	seederSvc := dht.NewService(newIdentity(t), "127.0.0.1:0", "", []string{bootstrapAddr})
 
-	// Register file transfer handlers on seeder DHT router
-	seederRouter := seederSvc.Router()
-	seederRouter.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetMetadataRequest
-		proto.Unmarshal(env.Payload, &req)
-		loadedMeta, _ := seederStore.LoadManifest(req.FileId)
-		mBytes, _ := json.Marshal(loadedMeta)
-		resp := &protocol.GetMetadataResponse{FileId: req.FileId, Success: true, MetadataJson: mBytes}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-	})
-	seederRouter.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetChunkRequest
-		proto.Unmarshal(env.Payload, &req)
-		chunkData, _ := seederStore.ReadChunk(req.FileId, int(req.ChunkIndex))
-		resp := &protocol.GetChunkResponse{FileId: req.FileId, ChunkIndex: req.ChunkIndex, Success: true, Data: chunkData}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-	})
+	transfer.NewServer(seederStore).Register(seederSvc.Router())
 
 	if err := seederSvc.Start(); err != nil {
 		t.Fatalf("failed to start seeder service: %v", err)

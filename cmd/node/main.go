@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -17,9 +16,8 @@ import (
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/downloader"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/identity"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
-	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/storage"
-	"google.golang.org/protobuf/proto"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/transfer"
 )
 
 // ANSI terminal color codes
@@ -109,7 +107,7 @@ func runWithDHT(id *identity.Identity, mode, port, filePath, dataDir string, chu
 	store := storage.NewStore(dataDir)
 
 	// Register file-transfer handlers on the DHT service's router.
-	registerFileHandlers(svc.Router(), store)
+	transfer.NewServer(store).Register(svc.Router())
 
 	// Start the DHT service (TCP listener + bootstrap).
 	if err := svc.Start(); err != nil {
@@ -147,68 +145,6 @@ func runWithDHT(id *identity.Identity, mode, port, filePath, dataDir string, chu
 	fmt.Printf("\n%s[SERVER]%s Stopping...\n", colorYellow, colorReset)
 	svc.Stop()
 	fmt.Printf("%s[SERVER]%s Stopped cleanly.\n", colorGreen, colorReset)
-}
-
-func registerFileHandlers(router *network.Router, store *storage.Store) {
-	// Metadata handler
-	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetMetadataRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-		fmt.Printf("%s[RPC]%s Metadata Request for File ID: %s from %s\n",
-			colorYellow, colorReset, req.FileId, conn.RemoteAddr().String())
-
-		meta, err := store.LoadManifest(req.FileId)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   fmt.Sprintf("manifest not found: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-		manifestBytes, err := json.Marshal(meta)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   fmt.Sprintf("failed to marshal manifest: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-		resp := &protocol.GetMetadataResponse{
-			FileId:       req.FileId,
-			Success:      true,
-			MetadataJson: manifestBytes,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-	})
-
-	// Chunk handler
-	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetChunkRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-		chunkData, err := store.ReadChunk(req.FileId, int(req.ChunkIndex))
-		if err != nil {
-			resp := &protocol.GetChunkResponse{
-				FileId:     req.FileId,
-				ChunkIndex: req.ChunkIndex,
-				Success:    false,
-				Error:      fmt.Sprintf("chunk read failed: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-		}
-		resp := &protocol.GetChunkResponse{
-			FileId:     req.FileId,
-			ChunkIndex: req.ChunkIndex,
-			Success:    true,
-			Data:       chunkData,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-	})
 }
 
 //---------------------------------------------------------------------
@@ -395,63 +331,7 @@ func runSeeder(id *identity.Identity, port, filePath, dataDir string, chunkSize 
 	server := network.NewServer(listenAddr, id.ServerTLSConfig())
 	router := network.NewRouter()
 
-	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetMetadataRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-		fmt.Printf("%s[RPC]%s Received Metadata Request for File ID: %s from %s\n",
-			colorYellow, colorReset, req.FileId, conn.RemoteAddr().String())
-
-		meta, err := store.LoadManifest(req.FileId)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   fmt.Sprintf("manifest not found: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-		manifestBytes, err := json.Marshal(meta)
-		if err != nil {
-			resp := &protocol.GetMetadataResponse{
-				FileId:  req.FileId,
-				Success: false,
-				Error:   fmt.Sprintf("failed to marshal manifest: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-		}
-		resp := &protocol.GetMetadataResponse{
-			FileId:       req.FileId,
-			Success:      true,
-			MetadataJson: manifestBytes,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_METADATA_RESPONSE, resp)
-	})
-
-	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(conn *network.Connection, env *protocol.Envelope) error {
-		var req protocol.GetChunkRequest
-		if err := proto.Unmarshal(env.Payload, &req); err != nil {
-			return err
-		}
-		chunkData, err := store.ReadChunk(req.FileId, int(req.ChunkIndex))
-		if err != nil {
-			resp := &protocol.GetChunkResponse{
-				FileId:     req.FileId,
-				ChunkIndex: req.ChunkIndex,
-				Success:    false,
-				Error:      fmt.Sprintf("chunk read failed: %v", err),
-			}
-			return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-		}
-		resp := &protocol.GetChunkResponse{
-			FileId:     req.FileId,
-			ChunkIndex: req.ChunkIndex,
-			Success:    true,
-			Data:       chunkData,
-		}
-		return conn.WriteResponse(env.Id, protocol.MessageType_MSG_GET_CHUNK_RESPONSE, resp)
-	})
+	transfer.NewServer(store).Register(router)
 
 	server.OnNewConnection = func(conn *network.Connection) {
 		fmt.Printf("%s[SERVER]%s Connected to new peer: %s\n", colorGreen, colorReset, conn.RemoteAddr().String())
