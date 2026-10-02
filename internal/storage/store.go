@@ -3,7 +3,6 @@ package storage
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 
@@ -115,40 +114,6 @@ func (s *Store) ReadChunk(fileID string, index int) ([]byte, error) {
 
 	chunkPath := filepath.Join(s.layout.ChunksDir(fileID), fmt.Sprintf("%d.chunk", index))
 	return os.ReadFile(chunkPath)
-}
-
-// WriteChunksFromReader splits a stream into chunk files and stores them directly to disk.
-func (s *Store) WriteChunksFromReader(src io.Reader, fileID string, chunkSize int) error {
-	if chunkSize <= 0 {
-		chunkSize = filemeta.DefaultChunkSize
-	}
-	if err := s.InitializeFileDirectories(fileID); err != nil {
-		return err
-	}
-
-	buf := make([]byte, chunkSize)
-	index := 0
-
-	for {
-		n, readErr := io.ReadFull(src, buf)
-		if n == 0 {
-			break
-		}
-		if readErr != nil && readErr != io.ErrUnexpectedEOF {
-			return fmt.Errorf("read chunk %d: %w", index, readErr)
-		}
-
-		if err := s.WriteChunk(fileID, index, buf[:n]); err != nil {
-			return err
-		}
-		index++
-
-		if readErr == io.ErrUnexpectedEOF {
-			break
-		}
-	}
-
-	return nil
 }
 
 // StoreModel takes a source file path and chunks it, saves chunks and the manifest.

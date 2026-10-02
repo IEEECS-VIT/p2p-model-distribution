@@ -2,7 +2,6 @@ package storage
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -65,20 +64,6 @@ func TestStoreOperations(t *testing.T) {
 		t.Errorf("loaded manifest mismatch: got %v, want %v", loadedMeta, meta)
 	}
 
-	// 4. WriteChunksFromReader
-	readerData := []byte("AABBCCDDEEFF")
-	reader := bytes.NewReader(readerData)
-	if err := store.WriteChunksFromReader(reader, "file-abc", 4); err != nil {
-		t.Fatalf("WriteChunksFromReader failed: %v", err)
-	}
-
-	// Verify chunk files exist
-	for i := 0; i < 3; i++ {
-		chunkPath := filepath.Join(store.Layout().ChunksDir("file-abc"), fmt.Sprintf("%d.chunk", i))
-		if _, err := os.Stat(chunkPath); err != nil {
-			t.Errorf("expected chunk %d to exist", i)
-		}
-	}
 }
 
 func TestDefaultChunkSizeFallback(t *testing.T) {

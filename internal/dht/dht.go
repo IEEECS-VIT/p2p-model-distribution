@@ -1,15 +1,9 @@
 package dht
 
-type Transport interface {
-	Send(Message) error
-}
-
 type DHT struct {
-	Self           Node
-	RoutingTable   *RoutingTable
-	Providers      *ProviderStore
-	Transport      Transport
-	BootstrapPeers []Node
+	Self         Node
+	RoutingTable *RoutingTable
+	Providers    *ProviderStore
 }
 
 func NewDHT(self Node) *DHT {
@@ -29,20 +23,6 @@ func (d *DHT) AddPeer(peer Node) {
 	}
 
 	d.RoutingTable.AddNode(peer)
-}
-
-func (d *DHT) Bootstrap(peers []Node) {
-	if d == nil {
-		return
-	}
-	if d.RoutingTable == nil {
-		d.RoutingTable = NewRoutingTable(d.Self.ID)
-	}
-
-	d.BootstrapPeers = append([]Node(nil), peers...)
-	for _, peer := range peers {
-		d.AddPeer(peer)
-	}
 }
 
 func (d *DHT) RecordProvider(chunkHash string, providerID string) {

@@ -539,37 +539,6 @@ func (s *Service) bootstrapOnce() {
 }
 
 //---------------------------------------------------------------------
-// DHT Transport implementation (implements dht.Transport)
-
-// Send implements dht.Transport by finding or creating a connection
-// to the destination peer and sending the message as a DHT RPC.
-func (s *Service) Send(msg Message) error {
-	addr, ok := s.addrs[msg.To.ID]
-	if !ok {
-		addr = fmt.Sprintf("%s:%d", msg.To.IP, msg.To.Port)
-	}
-	conn, err := s.GetConnection(addr)
-	if err != nil {
-		return fmt.Errorf("send to %s: %w", addr, err)
-	}
-
-	body := &protocol.DHTMessageBody{
-		Type:     msg.Type,
-		FromID:   s.self.ID,
-		TargetID: msg.TargetID,
-		Key:      msg.Key,
-		Value:    msg.Value,
-	}
-	payload, _ := protocol.MarshalDHTMessage(body)
-
-	msgType := protocol.RequestMessageType(msg.Type)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, err = conn.SendRaw(ctx, msgType, payload)
-	return err
-}
-
-//---------------------------------------------------------------------
 // Helpers
 
 func extractIP(external, listen string) string {
@@ -607,6 +576,3 @@ func splitHostPort(addr string) (string, string) {
 	}
 	return host, port
 }
-
-// Ensure Service satisfies the Transport interface.
-var _ Transport = (*Service)(nil)
