@@ -3,8 +3,11 @@ package network
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,7 +113,7 @@ func TestConnection_DuplicateResponsesDoNotWedgeReadLoop(t *testing.T) {
 			}
 			var req protocol.Envelope
 			_ = proto.Unmarshal(data, &req)
-			resp, _ := proto.Marshal(&protocol.Envelope{Id: req.Id, Type: protocol.MessageType_MSG_GET_CHUNK_RESPONSE})
+			resp, _ := proto.Marshal(&protocol.Envelope{Id: req.Id, Type: protocol.MessageType_MSG_GET_CHUNK_RESPONSE, IsResponse: true})
 			repeats := 1
 			if i == 0 {
 				repeats = 10
@@ -256,5 +259,74 @@ func TestConnection_RPCRoundtrip(t *testing.T) {
 
 	if !chunkResp.Success || !bytes.Equal(chunkResp.Data, []byte("mock-chunk-data")) || chunkResp.ChunkIndex != 5 {
 		t.Errorf("chunk response data mismatch: index=%d, success=%v, data=%s", chunkResp.ChunkIndex, chunkResp.Success, string(chunkResp.Data))
+	}
+}
+
+func TestRouter_UnknownTypeGetsErrorResponse(t *testing.T) {
+	_, raw := startRawPeer(t, NewRouter())
+	client := NewConnection(raw, "server")
+	client.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := client.SendRaw(ctx, protocol.MessageType(999), nil)
+	var remote *RemoteError
+	if !errors.As(err, &remote) {
+		t.Fatalf("SendRaw err = %v, want *RemoteError before the timeout", err)
+	}
+}
+
+func TestRouter_HandlerErrorsAreNotLeaked(t *testing.T) {
+	router := NewRouter()
+	router.Register(protocol.MessageType_MSG_GET_CHUNK_REQUEST, func(*Connection, *protocol.Envelope) error {
+		return fmt.Errorf("open /secret/path/0.chunk: permission denied")
+	})
+	router.Register(protocol.MessageType_MSG_GET_METADATA_REQUEST, func(*Connection, *protocol.Envelope) error {
+		return fmt.Errorf("%w: unknown file", ErrBadRequest)
+	})
+	_, raw := startRawPeer(t, router)
+	client := NewConnection(raw, "server")
+	client.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := client.SendRaw(ctx, protocol.MessageType_MSG_GET_CHUNK_REQUEST, nil)
+	var remote *RemoteError
+	if !errors.As(err, &remote) || strings.Contains(remote.Message, "secret") {
+		t.Fatalf("internal error leaked or missing: %v", err)
+	}
+
+	_, err = client.SendRaw(ctx, protocol.MessageType_MSG_GET_METADATA_REQUEST, nil)
+	if !errors.As(err, &remote) || !strings.Contains(remote.Message, "unknown file") {
+		t.Fatalf("bad-request message not propagated: %v", err)
+	}
+}
+
+// TestConnection_UnsolicitedResponsesAreIgnored checks that responses are
+// never routed: otherwise an unsolicited response would trigger an error
+// reply, which the peer would answer with another error, and so on.
+func TestConnection_UnsolicitedResponsesAreIgnored(t *testing.T) {
+	called := make(chan struct{}, 1)
+	router := NewRouter()
+	router.Register(protocol.MessageType_MSG_GET_CHUNK_RESPONSE, func(*Connection, *protocol.Envelope) error {
+		called <- struct{}{}
+		return nil
+	})
+	_, raw := startRawPeer(t, router)
+
+	resp, _ := proto.Marshal(&protocol.Envelope{Id: "nobody-asked", Type: protocol.MessageType_MSG_GET_CHUNK_RESPONSE, IsResponse: true})
+	if err := WriteFrame(raw, resp); err != nil {
+		t.Fatal(err)
+	}
+
+	raw.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := ReadFrame(raw); err == nil {
+		t.Fatal("peer replied to an unsolicited response")
+	}
+	select {
+	case <-called:
+		t.Fatal("response was routed to a handler")
+	default:
 	}
 }

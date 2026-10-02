@@ -163,25 +163,31 @@ func (c *Connection) readLoop() {
 			return
 		}
 
-		// A response to one of our requests: hand it to the waiting
-		// caller exactly once. Removing the entry here means a duplicate
-		// response with the same ID is treated as an unknown message
-		// rather than blocking on a full channel.
-		c.mu.Lock()
-		ch, exists := c.pendingRequests[env.Id]
-		if exists {
-			delete(c.pendingRequests, env.Id)
-		}
-		r := c.router
-		c.mu.Unlock()
-
-		if exists {
-			ch <- env // buffered with capacity 1 and only ever sent to once
+		if env.IsResponse {
+			// A response to one of our requests: hand it to the waiting
+			// caller exactly once. Removing the entry here means a
+			// duplicate (or late) response is dropped rather than
+			// blocking on a full channel. Responses are never routed, so
+			// two peers can never bounce error replies back and forth.
+			c.mu.Lock()
+			ch, exists := c.pendingRequests[env.Id]
+			if exists {
+				delete(c.pendingRequests, env.Id)
+			}
+			c.mu.Unlock()
+			if exists {
+				ch <- env // buffered with capacity 1 and only ever sent to once
+			}
 			continue
 		}
 
-		// Incoming request or notification.
+		// Incoming request.
+		c.mu.Lock()
+		r := c.router
+		c.mu.Unlock()
 		if r == nil {
+			// Outbound-only connection: requests are not served. Drop
+			// rather than reply, so the read loop never blocks on a write.
 			continue
 		}
 		c.routeSem <- struct{}{}
@@ -219,27 +225,17 @@ func (c *Connection) WriteResponse(reqID string, msgType protocol.MessageType, r
 		return fmt.Errorf("marshal response: %w", err)
 	}
 
-	env := &protocol.Envelope{
-		Id:      reqID,
-		Type:    msgType,
-		Payload: payload,
-	}
-
-	envBytes, err := proto.Marshal(env)
-	if err != nil {
-		return fmt.Errorf("marshal envelope: %w", err)
-	}
-
-	return c.WriteMessage(envBytes)
+	return c.WriteRawResponse(reqID, msgType, payload)
 }
 
 // WriteRawResponse writes a pre-serialised payload as a response to a request.
 // This is used by the DHT layer which uses JSON serialisation instead of protobuf.
 func (c *Connection) WriteRawResponse(reqID string, msgType protocol.MessageType, payload []byte) error {
 	env := &protocol.Envelope{
-		Id:      reqID,
-		Type:    msgType,
-		Payload: payload,
+		Id:         reqID,
+		Type:       msgType,
+		Payload:    payload,
+		IsResponse: true,
 	}
 
 	envBytes, err := proto.Marshal(env)
@@ -292,6 +288,9 @@ func (c *Connection) SendRaw(ctx context.Context, msgType protocol.MessageType, 
 	case resp, ok := <-respChan:
 		if !ok {
 			return nil, fmt.Errorf("connection closed during request")
+		}
+		if resp.Type == protocol.MessageType_MSG_ERROR {
+			return nil, decodeError(resp)
 		}
 		return resp, nil
 	case <-ctx.Done():
