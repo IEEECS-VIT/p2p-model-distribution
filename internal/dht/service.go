@@ -29,9 +29,10 @@ type Service struct {
 	listen   string
 	external string // address we advertise to other peers ("ip:port")
 
+	pool *pool
+
 	mu    sync.RWMutex
-	conns map[string]*network.Connection // peerID -> active connection
-	addrs map[string]string              // peerID -> "ip:port" for reconnecting
+	addrs map[string]string // peerID -> "ip:port" for reconnecting
 
 	bootstrap []string // "ip:port" addresses of bootstrap peers
 
@@ -46,16 +47,17 @@ type Service struct {
 func NewService(id *identity.Identity, listen, external string, seeds []string) *Service {
 	self := Node{ID: id.ID(), IP: extractIP(external, listen), Port: extractPort(external, listen)}
 
+	router := network.NewRouter()
 	return &Service{
 		id:        id,
 		self:      self,
 		table:     NewRoutingTable(self.ID),
 		store:     NewStore(),
 		server:    network.NewServer(listen, id.ServerTLSConfig()),
-		router:    network.NewRouter(),
+		router:    router,
+		pool:      newPool(id, router),
 		listen:    listen,
 		external:  external,
-		conns:     make(map[string]*network.Connection),
 		addrs:     make(map[string]string),
 		bootstrap: seeds,
 	}
@@ -84,6 +86,7 @@ func (s *Service) Start() error {
 	s.server.OnNewConnection = func(conn *network.Connection) {
 		conn.SetRouter(s.router)
 		conn.Start()
+		s.pool.add(conn)
 	}
 
 	if err := s.server.Start(); err != nil {
@@ -110,12 +113,7 @@ func (s *Service) Stop() {
 	if s.cancel != nil {
 		s.cancel()
 	}
-	s.mu.Lock()
-	for id, c := range s.conns {
-		_ = c.Close()
-		delete(s.conns, id)
-	}
-	s.mu.Unlock()
+	s.pool.closeAll()
 	s.server.Stop()
 }
 
@@ -127,13 +125,7 @@ func (s *Service) Stop() {
 func (s *Service) AnnounceProvider(key string) int {
 	s.store.Add(key, s.self.ID)
 
-	s.mu.RLock()
-	peers := make([]*network.Connection, 0, len(s.conns))
-	for _, c := range s.conns {
-		peers = append(peers, c)
-	}
-	s.mu.RUnlock()
-
+	peers := s.pool.all()
 	for _, c := range peers {
 		go func(conn *network.Connection) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -146,9 +138,7 @@ func (s *Service) AnnounceProvider(key string) int {
 
 // ConnectedPeersCount returns the number of active peer connections.
 func (s *Service) ConnectedPeersCount() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.conns)
+	return s.pool.count()
 }
 
 // FindProviders returns provider IDs for key from the local store and
@@ -162,9 +152,7 @@ func (s *Service) FindProviders(ctx context.Context, key string) []string {
 	providers := append([]string(nil), local...)
 
 	for _, peer := range s.table.ClosestNodes(key, K) {
-		s.mu.RLock()
-		conn, ok := s.conns[peer.ID]
-		s.mu.RUnlock()
+		conn, ok := s.pool.get(peer.ID)
 		if !ok {
 			continue
 		}
@@ -226,9 +214,7 @@ func (s *Service) QueryNodeAddress(ctx context.Context, targetID string) (string
 	}
 
 	for _, peer := range s.table.ClosestNodes(targetID, K) {
-		s.mu.RLock()
-		conn, ok := s.conns[peer.ID]
-		s.mu.RUnlock()
+		conn, ok := s.pool.get(peer.ID)
 		if !ok {
 			continue
 		}
@@ -255,29 +241,10 @@ func (s *Service) QueryNodeAddress(ctx context.Context, targetID string) (string
 	return "", false
 }
 
-// GetConnection returns (or creates) a connection to a peer by address.
+// GetConnection returns (or creates) a connection to whichever node
+// answers at addr.
 func (s *Service) GetConnection(addr string) (*network.Connection, error) {
-	s.mu.RLock()
-	for _, c := range s.conns {
-		if c.RemoteAddr().String() == addr {
-			s.mu.RUnlock()
-			return c, nil
-		}
-	}
-	s.mu.RUnlock()
-
-	conn, err := network.Dial(context.Background(), addr, s.id.ClientTLSConfig(""))
-	if err != nil {
-		return nil, err
-	}
-	conn.SetRouter(s.router)
-	conn.Start()
-
-	s.mu.Lock()
-	s.conns[conn.PeerID()] = conn
-	s.mu.Unlock()
-
-	return conn, nil
+	return s.pool.connectAddr(context.Background(), addr)
 }
 
 func (s *Service) sendDHTRequest(ctx context.Context, conn *network.Connection, msgType protocol.MessageType, key string) (*protocol.DHTResponse, error) {
@@ -347,24 +314,12 @@ func (s *Service) handleAddProvider(from Node, req *protocol.DHTRequest, _ *prot
 	}
 }
 
-// trackPeer records conn under the peer's authenticated node ID and adds
-// the peer to the routing table. The peer's address is the IP observed on
+// trackPeer adds the peer on conn to the routing table. The peer's address is the IP observed on
 // the socket plus the listen port it advertises (the only self-reported
 // field we use): trusting a self-reported IP would let a peer point other
 // nodes at arbitrary third-party hosts.
 func (s *Service) trackPeer(conn *network.Connection, listenPort uint32) Node {
 	peerID := conn.PeerID()
-
-	s.mu.Lock()
-	for k, v := range s.conns {
-		if v == conn && k != peerID {
-			delete(s.conns, k)
-			break
-		}
-	}
-	s.conns[peerID] = conn
-	s.mu.Unlock()
-
 	ip, _ := splitHostPort(conn.RemoteAddr().String())
 	node := Node{ID: peerID, IP: ip, Port: int(listenPort)}
 	if listenPort > 0 && listenPort <= 65535 {
