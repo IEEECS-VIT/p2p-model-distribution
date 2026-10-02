@@ -5,7 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"strconv"
 	"sync"
@@ -108,8 +108,7 @@ func (s *Service) Start() error {
 		s.self.Port = addr.Port
 	}
 
-	log.Printf("[DHT] Node %s listening on %s (advertised: %s:%d)",
-		s.self.ID, s.listen, s.self.IP, s.self.Port)
+	slog.Info("DHT node listening", "id", s.self.ID, "listen", s.listen, "advertised", s.self.Endpoint())
 
 	go s.maintain(ctx)
 
@@ -409,7 +408,7 @@ func (s *Service) maintain(ctx context.Context) {
 		if s.table.Size() > 0 {
 			break
 		}
-		log.Printf("[DHT] could not join the network; retrying in %v", backoff)
+		slog.Warn("could not join the network; retrying", "retry_in", backoff)
 		select {
 		case <-ctx.Done():
 			return
@@ -455,7 +454,7 @@ func (s *Service) bootstrapFrom(addrs []string) {
 	for _, addr := range addrs {
 		conn, err := s.pool.connectAddr(context.Background(), addr)
 		if err != nil {
-			log.Printf("[DHT] bootstrap dial %s: %v", addr, err)
+			slog.Warn("bootstrap peer unreachable", "addr", addr, "err", err)
 			continue
 		}
 
@@ -464,11 +463,11 @@ func (s *Service) bootstrapFrom(addrs []string) {
 		resp, err := s.sendDHTRequest(ctx, conn, protocol.MessageType_MSG_DHT_FIND_NODE, s.self.ID)
 		cancel()
 		if err != nil {
-			log.Printf("[DHT] bootstrap FIND_NODE to %s: %v", addr, err)
+			slog.Warn("bootstrap lookup failed", "addr", addr, "err", err)
 			continue
 		}
 
-		log.Printf("[DHT] Bootstrap %s returned %d peers", addr, len(resp.CloserPeers))
+		slog.Debug("bootstrap peer answered", "addr", addr, "peers", len(resp.CloserPeers))
 	}
 
 	// Look up our own ID through the network to fill the routing table
