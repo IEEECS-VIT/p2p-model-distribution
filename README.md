@@ -35,7 +35,7 @@ tracker.
  │      │ downloader │   │ transfer      │   │ dht        │   │ storage  │  │
  │      │ (fetch)    │   │ (serve files) │   │ (discover) │   │ (disk)   │  │
  │      └─────┬──────┘   └──────┬────────┘   └─────┬──────┘   └────┬─────┘  │
- │            └──────────┬──────┴──────────────────┘          filemeta     │
+ │            └──────────┬──────┴──────────────────┘          filemeta      │
  │                   network (mutual TLS 1.3, framed protobuf RPC)          │
  │                   identity (ed25519 key → node ID, certificates)         │
  └──────────────────────────────────────────────────────────────────────────┘
