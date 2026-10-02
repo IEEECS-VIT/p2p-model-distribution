@@ -12,6 +12,11 @@ const DefaultBaseDir = "data/files"
 // use as a filesystem path component.
 var ErrInvalidFileID = errors.New("invalid file id")
 
+// stagingDirName is the directory under the base dir where StoreModel
+// writes chunks before the file ID is known. The leading dot makes it an
+// invalid file ID, so it can never collide with a real file directory.
+const stagingDirName = ".staging"
+
 // maxFileIDLength is a generous bound on file ID length; real IDs are short
 // hex strings (16 or 64 chars).
 const maxFileIDLength = 256

@@ -24,13 +24,13 @@ func TestRoundTrip(t *testing.T) {
 
 	const chunkSize = 256 * 1024
 	store := storage.NewStore(t.TempDir())
-	meta, _, err := store.StoreModel(srcPath, "file-123", chunkSize)
+	meta, err := store.StoreModel(srcPath, chunkSize)
 	if err != nil {
 		t.Fatalf("StoreModel failed: %v", err)
 	}
 	chunks := meta.Chunks
 	modelHash := meta.ModelHash
-	chunkDir := store.Layout().ChunksDir("file-123")
+	chunkDir := store.Layout().ChunksDir(meta.FileID)
 
 	expectedChunks := (fileSize + chunkSize - 1) / chunkSize
 	if len(chunks) != expectedChunks {
@@ -83,7 +83,7 @@ func TestSingleChunk(t *testing.T) {
 	os.WriteFile(srcPath, data, 0644)
 
 	store := storage.NewStore(t.TempDir())
-	meta, _, err := store.StoreModel(srcPath, "file-123", 256*1024)
+	meta, err := store.StoreModel(srcPath, 256*1024)
 	if err != nil {
 		t.Fatal(err)
 	}

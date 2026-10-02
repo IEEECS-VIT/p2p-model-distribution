@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -218,18 +217,17 @@ func runDHSeeder(ctx context.Context, filePath, dataDir string, chunkSize int, s
 			log.Fatalf("failed to open source file: %v", err)
 		}
 
-		fileID = generateRandomID()
 		fmt.Printf("%s[SEEDER]%s Chunking %s%s%s (%.2f MB)...\n",
 			colorBlue, colorReset, colorBold, info.Name(), colorReset, float64(info.Size())/(1024*1024))
 
-		meta, cid, err := store.StoreModel(filePath, fileID, chunkSize)
+		meta, err := store.StoreModel(filePath, chunkSize)
 		if err != nil {
 			log.Fatalf("failed to split and seed model: %v", err)
 		}
+		fileID = meta.FileID
 
 		fmt.Printf("%s[SEEDER]%s ✓ Chunks stored under: %s/%s/chunks\n", colorGreen, colorReset, dataDir, fileID)
 		fmt.Printf("%s[SEEDER]%s ✓ File ID: %s%s%s (Use this ID to download)\n", colorGreen, colorReset, colorBold, fileID, colorReset)
-		fmt.Printf("%s[SEEDER]%s ✓ Manifest CID: %s\n", colorGreen, colorReset, cid)
 
 		// Wait for at least one peer connection if we have bootstrap peers configured,
 		// so that the initial announcement doesn't go into a black hole.
@@ -252,9 +250,6 @@ func runDHSeeder(ctx context.Context, filePath, dataDir string, chunkSize int, s
 		// Announce file ID and each chunk hash in the DHT.
 		fmt.Printf("%s[DHT]%s Announcing file in DHT...\n", colorBlue, colorReset)
 		numPeers := svc.AnnounceProvider(fileID)
-		for _, c := range meta.Chunks {
-			svc.AnnounceProvider(c.CID)
-		}
 		fmt.Printf("%s[DHT]%s ✓ File announced to %d connected peers\n", colorGreen, colorReset, numPeers)
 
 		// Periodically re-announce in the background to handle node churn/re-joins
@@ -265,9 +260,6 @@ func runDHSeeder(ctx context.Context, filePath, dataDir string, chunkSize int, s
 				select {
 				case <-ticker.C:
 					svc.AnnounceProvider(fileID)
-					for _, c := range meta.Chunks {
-						svc.AnnounceProvider(c.CID)
-					}
 				case <-ctx.Done():
 					return
 				}
@@ -380,14 +372,14 @@ func runSeeder(port, filePath, dataDir string, chunkSize int) {
 		if err != nil {
 			log.Fatalf("failed to open source file: %v", err)
 		}
-		genFileID := generateRandomID()
 		fmt.Printf("%s[SEEDER]%s Chunking original file %s%s%s (%.2f MB)...\n",
 			colorBlue, colorReset, colorBold, info.Name(), colorReset, float64(info.Size())/(1024*1024))
 
-		_, _, err = store.StoreModel(filePath, genFileID, chunkSize)
+		meta, err := store.StoreModel(filePath, chunkSize)
 		if err != nil {
 			log.Fatalf("failed to split and seed model: %v", err)
 		}
+		genFileID := meta.FileID
 		fmt.Printf("%s[SEEDER]%s ✓ Chunks stored under: %s/%s/chunks\n", colorGreen, colorReset, dataDir, genFileID)
 		fmt.Printf("%s[SEEDER]%s ✓ File ID: %s%s%s (Use this ID to download)\n\n", colorGreen, colorReset, colorBold, genFileID, colorReset)
 	} else {
@@ -498,10 +490,4 @@ func printHeader() {
 	fmt.Printf("%s%s┌────────────────────────────────────────────────────────┐%s\n", colorBold, colorCyan, colorReset)
 	fmt.Printf("%s%s│             P2P MODEL DISTRIBUTION NODE                │%s\n", colorBold, colorCyan, colorReset)
 	fmt.Printf("%s%s└────────────────────────────────────────────────────────┘%s\n\n", colorBold, colorCyan, colorReset)
-}
-
-func generateRandomID() string {
-	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return fmt.Sprintf("%x", b)
 }

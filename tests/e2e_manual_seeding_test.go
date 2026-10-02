@@ -38,12 +38,11 @@ func TestEndToEnd_P2PDistribution(t *testing.T) {
 	// 2. Seeder Node Setup: Store model locally (creating manifest & chunks)
 	seederStore := storage.NewStore(seederDir)
 	chunkSize := 10 * 1024 // 10 KB chunk size
-	fileID := "model-v1-e2e"
-
-	meta, _, err := seederStore.StoreModel(srcPath, fileID, chunkSize)
+	meta, err := seederStore.StoreModel(srcPath, chunkSize)
 	if err != nil {
 		t.Fatalf("failed to seed model locally: %v", err)
 	}
+	fileID := meta.FileID
 
 	if len(meta.Chunks) != 11 {
 		t.Errorf("expected 11 chunks for 105KB file with 10KB chunk size, got %d", len(meta.Chunks))
@@ -273,8 +272,8 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 
 	// 3. Start Seeder Node with file registered
 	seederStore := storage.NewStore(seederDir)
-	fileID := "dht-model-test-id"
-	_, _, err := seederStore.StoreModel(srcPath, fileID, 20*1024) // 20 KB chunks
+	seeded, err := seederStore.StoreModel(srcPath, 20*1024) // 20 KB chunks
+	fileID := seeded.FileID
 	if err != nil {
 		t.Fatalf("failed to store model on seeder: %v", err)
 	}

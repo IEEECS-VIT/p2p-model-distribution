@@ -42,13 +42,13 @@ func TestStoreOperations(t *testing.T) {
 	meta := filemeta.FileMeta{
 		FileID:    fileID,
 		FileName:  "test.bin",
-		FileSize:  1000,
-		ModelHash: "sha256:abcd",
-		ChunkSize: 100,
-		NumChunks: 10,
-		Version:   "v1",
+		FileSize:  100,
+		ModelHash: filemeta.HashBytes([]byte("model")),
+		ChunkSize: filemeta.MinChunkSize,
+		NumChunks: 1,
+		Version:   filemeta.ManifestVersion,
 		Chunks: []filemeta.ChunkMeta{
-			{Index: 0, CID: "sha256:chunk0", Hash: "sha256:chunk0", Size: 100},
+			{Index: 0, Hash: filemeta.HashBytes([]byte("chunk0")), Size: 100},
 		},
 	}
 
@@ -78,7 +78,7 @@ func TestDefaultChunkSizeFallback(t *testing.T) {
 	}
 
 	// Passing 0 should fall back to 1MB (DefaultChunkSize)
-	meta, _, err := store.StoreModel(srcPath, "file-fallback", 0)
+	meta, err := store.StoreModel(srcPath, 0)
 	if err != nil {
 		t.Fatalf("StoreModel failed: %v", err)
 	}
@@ -88,5 +88,43 @@ func TestDefaultChunkSizeFallback(t *testing.T) {
 	}
 	if meta.NumChunks != 3 {
 		t.Errorf("expected 3 chunks for 2.5MB data with 1MB chunk size, got %d", meta.NumChunks)
+	}
+}
+
+func TestStoreModelIsContentAddressed(t *testing.T) {
+	tempDir := t.TempDir()
+	store := NewStore(filepath.Join(tempDir, "store"))
+	srcPath := filepath.Join(tempDir, "model.bin")
+	if err := os.WriteFile(srcPath, bytes.Repeat([]byte("weights"), 5000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := store.StoreModel(srcPath, filemeta.MinChunkSize)
+	if err != nil {
+		t.Fatalf("StoreModel: %v", err)
+	}
+	if err := meta.VerifyID(meta.FileID); err != nil {
+		t.Fatalf("FileID is not the manifest CID: %v", err)
+	}
+	if !store.HasCompleteFile(meta.FileID) {
+		t.Fatal("HasCompleteFile = false after StoreModel")
+	}
+
+	// Storing identical content again yields the same ID and is a no-op.
+	again, err := store.StoreModel(srcPath, filemeta.MinChunkSize)
+	if err != nil {
+		t.Fatalf("second StoreModel: %v", err)
+	}
+	if again.FileID != meta.FileID {
+		t.Fatalf("same content got different IDs: %s vs %s", meta.FileID, again.FileID)
+	}
+
+	// The staging area is cleaned up.
+	entries, err := os.ReadDir(filepath.Join(tempDir, "store", stagingDirName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("staging dir not cleaned up: %d entries", len(entries))
 	}
 }

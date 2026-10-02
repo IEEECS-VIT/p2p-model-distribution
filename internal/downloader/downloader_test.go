@@ -39,9 +39,8 @@ func TestDownloader_HappyPathParallel(t *testing.T) {
 
 	// 3. Chunk and seed file using StoreModel
 	seederStore := storage.NewStore(seederDir)
-	fileID := "test-file-id"
-
-	_, _, err = seederStore.StoreModel(srcFilePath, fileID, 1024*1024)
+	seeded, err := seederStore.StoreModel(srcFilePath, 1024*1024)
+	fileID := seeded.FileID
 	if err != nil {
 		t.Fatalf("failed to seed model: %v", err)
 	}
@@ -149,9 +148,8 @@ func TestDownloader_FailoverAndRetry(t *testing.T) {
 
 	// 3. Chunk and seed using StoreModel
 	seederStore := storage.NewStore(seederDir)
-	fileID := "test-file-id"
-
-	_, _, err = seederStore.StoreModel(srcFilePath, fileID, 1024*1024)
+	seeded, err := seederStore.StoreModel(srcFilePath, 1024*1024)
+	fileID := seeded.FileID
 	if err != nil {
 		t.Fatalf("failed to seed model: %v", err)
 	}
