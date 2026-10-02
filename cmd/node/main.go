@@ -255,7 +255,7 @@ func runDHSeeder(ctx context.Context, filePath, dataDir string, chunkSize int, s
 	connected:
 		// Announce file ID and each chunk hash in the DHT.
 		fmt.Printf("%s[DHT]%s Announcing file in DHT...\n", colorBlue, colorReset)
-		numPeers := svc.AnnounceProvider(fileID)
+		numPeers := svc.AnnounceProvider(ctx, fileID)
 		fmt.Printf("%s[DHT]%s ✓ File announced to %d connected peers\n", colorGreen, colorReset, numPeers)
 
 		// Periodically re-announce in the background to handle node churn/re-joins
@@ -265,7 +265,7 @@ func runDHSeeder(ctx context.Context, filePath, dataDir string, chunkSize int, s
 			for {
 				select {
 				case <-ticker.C:
-					svc.AnnounceProvider(fileID)
+					svc.AnnounceProvider(ctx, fileID)
 				case <-ctx.Done():
 					return
 				}
@@ -302,7 +302,7 @@ func runDHSeeder(ctx context.Context, filePath, dataDir string, chunkSize int, s
 		existingConnected:
 			fmt.Printf("%s[DHT]%s Announcing %d existing files in DHT...\n", colorBlue, colorReset, len(fileIDs))
 			for _, fid := range fileIDs {
-				svc.AnnounceProvider(fid)
+				svc.AnnounceProvider(ctx, fid)
 			}
 
 			// Periodically re-announce in the background
@@ -313,7 +313,7 @@ func runDHSeeder(ctx context.Context, filePath, dataDir string, chunkSize int, s
 					select {
 					case <-ticker.C:
 						for _, fid := range fileIDs {
-							svc.AnnounceProvider(fid)
+							svc.AnnounceProvider(ctx, fid)
 						}
 					case <-ctx.Done():
 						return

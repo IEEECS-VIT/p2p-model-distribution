@@ -315,7 +315,7 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Announce file ID
-	seederSvc.AnnounceProvider(fileID)
+	seederSvc.AnnounceProvider(context.Background(), fileID)
 
 	// 4. Start Downloader Node
 	downloaderStore := storage.NewStore(downloaderDir)

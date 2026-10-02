@@ -115,20 +115,28 @@ func (s *Service) Stop() {
 //---------------------------------------------------------------------
 // Provider API
 
-// AnnounceProvider records this node as a provider for key in the local
-// store and sends ADD_PROVIDER to every connected peer.
-func (s *Service) AnnounceProvider(key string) int {
+// AnnounceProvider records this node as a provider for key and sends
+// ADD_PROVIDER to the K nodes closest to key, found by an iterative
+// lookup. It returns how many of them accepted the record.
+func (s *Service) AnnounceProvider(ctx context.Context, key string) int {
 	s.store.Add(key, s.self)
 
-	peers := s.pool.all()
-	for _, c := range peers {
-		go func(conn *network.Connection) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_, _ = s.sendDHTRequest(ctx, conn, protocol.MessageType_MSG_DHT_ADD_PROVIDER, key)
-		}(c)
+	closest, _ := s.lookup(ctx, key, false, 0)
+
+	accepted := make(chan bool, len(closest))
+	for _, n := range closest {
+		go func(n Node) {
+			_, err := s.query(ctx, n, protocol.MessageType_MSG_DHT_ADD_PROVIDER, key)
+			accepted <- err == nil
+		}(n)
 	}
-	return len(peers)
+	count := 0
+	for range closest {
+		if <-accepted {
+			count++
+		}
+	}
+	return count
 }
 
 // ConnectedPeersCount returns the number of active peer connections.
@@ -136,47 +144,26 @@ func (s *Service) ConnectedPeersCount() int {
 	return s.pool.count()
 }
 
-// FindProviders returns the providers (with addresses) known for key,
-// from the local store and from FIND_VALUE queries to the closest
-// connected peers. This node is never included.
+// FindProviders returns providers (with addresses) for key from the
+// local store and an iterative FIND_VALUE lookup. This node is never
+// included.
 func (s *Service) FindProviders(ctx context.Context, key string) []Node {
 	seen := map[string]bool{s.self.ID: true}
 	var providers []Node
-	addProvider := func(n Node) {
+	add := func(n Node) {
 		if !seen[n.ID] {
 			seen[n.ID] = true
 			providers = append(providers, n)
 		}
 	}
 	for _, p := range s.store.Get(key) {
-		addProvider(p)
+		add(p)
 	}
 
-	for _, peer := range s.table.ClosestNodes(key, K) {
-		conn, ok := s.pool.get(peer.ID)
-		if !ok {
-			continue
-		}
-
-		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		resp, err := s.sendDHTRequest(reqCtx, conn, protocol.MessageType_MSG_DHT_FIND_VALUE, key)
-		cancel()
-		if err != nil {
-			continue
-		}
-
-		for _, p := range resp.Providers {
-			if node, ok := nodeFromWire(p); ok {
-				addProvider(node)
-			}
-		}
-		for _, n := range resp.CloserPeers {
-			if node, ok := nodeFromWire(n); ok {
-				s.table.AddNode(node)
-			}
-		}
+	_, found := s.lookup(ctx, key, true, K)
+	for _, p := range found {
+		add(p)
 	}
-
 	return providers
 }
 
@@ -337,6 +324,12 @@ func (s *Service) bootstrapOnce() {
 
 		log.Printf("[DHT] Bootstrap %s returned %d peers", addr, len(resp.CloserPeers))
 	}
+
+	// Look up our own ID through the network to fill the routing table
+	// with the nodes closest to us (the standard Kademlia join).
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s.lookup(ctx, s.self.ID, false, 0)
 }
 
 //---------------------------------------------------------------------
