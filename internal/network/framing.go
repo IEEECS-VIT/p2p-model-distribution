@@ -6,25 +6,24 @@ import (
 	"io"
 )
 
-// MaxMessageSize prevents malicious peers from crashing the server with OOM attacks.
-// Let's set it to 10MB for now (adjust based on your AI model chunk sizes).
+// MaxMessageSize prevents malicious peers from crashing the server with OOM
+// attacks. It must exceed filemeta.MaxChunkSize plus envelope overhead.
 const MaxMessageSize = 10 * 1024 * 1024
 
+// WriteFrame writes data prefixed with its 4-byte big-endian length.
+// Header and payload go out in a single Write so the frame is never split
+// across TLS records or syscalls unnecessarily.
 func WriteFrame(w io.Writer, data []byte) error {
-	// Optional: You could allocate a single buffer to do exactly 1 syscall,
-	// but writing twice is usually fine as long as the caller holds a Mutex!
-
-	header := make([]byte, 4)
-	binary.BigEndian.PutUint32(header, uint32(len(data)))
-
-	if _, err := w.Write(header); err != nil {
-		return err
+	if len(data) > MaxMessageSize {
+		return fmt.Errorf("message too large: %d bytes (max: %d)", len(data), MaxMessageSize)
 	}
 
-	if _, err := w.Write(data); err != nil {
-		return err
-	}
-	return nil
+	frame := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(frame, uint32(len(data)))
+	copy(frame[4:], data)
+
+	_, err := w.Write(frame)
+	return err
 }
 
 func ReadFrame(r io.Reader) ([]byte, error) {
