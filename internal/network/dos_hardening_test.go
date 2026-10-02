@@ -102,3 +102,30 @@ func TestServer_MaxConnectionsRejectsExcessConnections(t *testing.T) {
 		t.Fatal("expected the over-cap connection to be closed by the server")
 	}
 }
+
+func TestServer_StopClosesConnectionsAndIsIdempotent(t *testing.T) {
+	server := NewServer("127.0.0.1:0")
+	server.OnNewConnection = func(conn *Connection) { conn.Start() }
+	if err := server.Start(); err != nil {
+		t.Fatalf("failed to start server: %v", err)
+	}
+
+	raw, err := net.Dial("tcp", server.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer raw.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for server.ActiveConnections() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	server.Stop()
+	server.Stop() // must not panic
+
+	raw.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := raw.Read(make([]byte, 1)); err == nil {
+		t.Fatal("accepted connection still open after Stop")
+	}
+}

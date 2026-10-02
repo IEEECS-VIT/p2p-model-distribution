@@ -32,6 +32,13 @@ type Server struct {
 	maxConns atomic.Int32
 	// activeConns tracks how many accepted connections are currently open.
 	activeConns atomic.Int32
+
+	// conns holds every accepted, still-open connection so Stop can close
+	// them.
+	connsMu sync.Mutex
+	conns   map[*Connection]struct{}
+
+	stopOnce sync.Once
 }
 
 // NewServer creates a new P2P TCP server.
@@ -39,6 +46,7 @@ func NewServer(listenAddr string) *Server {
 	s := &Server{
 		listenAddr: listenAddr,
 		quit:       make(chan struct{}),
+		conns:      make(map[*Connection]struct{}),
 	}
 	s.maxConns.Store(DefaultMaxConnections)
 	return s
@@ -95,7 +103,13 @@ func (s *Server) acceptLoop() {
 		// At this raw TCP stage, we don't know the cryptographic PeerID yet,
 		// so we temporarily use the remote IP address.
 		wrappedConn := NewConnection(conn, conn.RemoteAddr().String())
+		s.connsMu.Lock()
+		s.conns[wrappedConn] = struct{}{}
+		s.connsMu.Unlock()
 		wrappedConn.SetOnClose(func() {
+			s.connsMu.Lock()
+			delete(s.conns, wrappedConn)
+			s.connsMu.Unlock()
 			s.activeConns.Add(-1)
 		})
 
@@ -109,6 +123,9 @@ func (s *Server) acceptLoop() {
 			// The read loop never started, so onClose won't fire; account
 			// for the slot here instead.
 			wrappedConn.Close()
+			s.connsMu.Lock()
+			delete(s.conns, wrappedConn)
+			s.connsMu.Unlock()
 			s.activeConns.Add(-1)
 		}
 	}
@@ -127,11 +144,24 @@ func (s *Server) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// Stop gracefully shuts down the listener and waits for the accept loop to exit.
+// Stop shuts down the listener, waits for the accept loop to exit, and
+// closes every accepted connection. It is safe to call more than once.
 func (s *Server) Stop() {
-	close(s.quit)
-	if s.listener != nil {
-		s.listener.Close()
-	}
-	s.wg.Wait()
+	s.stopOnce.Do(func() {
+		close(s.quit)
+		if s.listener != nil {
+			s.listener.Close()
+		}
+		s.wg.Wait()
+
+		s.connsMu.Lock()
+		conns := make([]*Connection, 0, len(s.conns))
+		for c := range s.conns {
+			conns = append(conns, c)
+		}
+		s.connsMu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
 }
