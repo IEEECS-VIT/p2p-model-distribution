@@ -75,6 +75,9 @@ type Connection struct {
 	// torn down.
 	done chan struct{}
 
+	// outbound is true for connections we dialed (see Dial).
+	outbound bool
+
 	// Timeouts are captured from the package defaults at construction.
 	readIdleTimeout time.Duration
 	writeTimeout    time.Duration
@@ -305,6 +308,14 @@ func (c *Connection) Close() error {
 // RemoteAddr returns the network address of the remote peer.
 func (c *Connection) RemoteAddr() net.Addr {
 	return c.conn.RemoteAddr()
+}
+
+// Outbound reports whether this side dialed the connection. For an
+// outbound connection RemoteAddr is the address we dialed, which (since
+// the TLS handshake authenticated the peer) is a verified address for
+// PeerID.
+func (c *Connection) Outbound() bool {
+	return c.outbound
 }
 
 // LocalAddr returns the local network address of the connection.

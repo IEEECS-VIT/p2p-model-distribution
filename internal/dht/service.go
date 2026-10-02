@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/identity"
@@ -30,6 +31,14 @@ type Service struct {
 
 	pool *pool
 
+	// Background routing-table maintenance (see addVerified and
+	// verifyInbound): in-progress work is deduplicated per node ID and
+	// inbound verification dials are bounded by verifySem.
+	pendingMu     sync.Mutex
+	pendingVerify map[string]bool
+	pendingEvict  map[string]bool
+	verifySem     chan struct{}
+
 	bootstrap []string // "ip:port" addresses of bootstrap peers
 
 	cancel context.CancelFunc
@@ -45,16 +54,20 @@ func NewService(id *identity.Identity, listen, external string, seeds []string) 
 
 	router := network.NewRouter()
 	return &Service{
-		id:        id,
-		self:      self,
-		table:     NewRoutingTable(self.ID),
-		store:     NewStore(),
-		server:    network.NewServer(listen, id.ServerTLSConfig()),
-		router:    router,
-		pool:      newPool(id, router),
-		listen:    listen,
-		external:  external,
-		bootstrap: seeds,
+		id:     id,
+		self:   self,
+		table:  NewRoutingTable(self.ID),
+		store:  NewStore(),
+		server: network.NewServer(listen, id.ServerTLSConfig()),
+		router: router,
+		pool:   newPool(id, router),
+
+		pendingVerify: make(map[string]bool),
+		pendingEvict:  make(map[string]bool),
+		verifySem:     make(chan struct{}, maxConcurrentVerifications),
+		listen:        listen,
+		external:      external,
+		bootstrap:     seeds,
 	}
 }
 
@@ -265,20 +278,116 @@ func (s *Service) selfAddrFor(conn *network.Connection) Node {
 	return self
 }
 
-// trackPeer adds the peer on conn to the routing table. The peer's address is the IP observed on
-// the socket plus the listen port it advertises (the only self-reported
-// field we use): trusting a self-reported IP would let a peer point other
-// nodes at arbitrary third-party hosts.
+// maxConcurrentVerifications bounds outbound dials made to verify the
+// listen addresses of peers that connected to us.
+const maxConcurrentVerifications = 16
+
+// trackPeer returns the peer on conn as a Node and feeds it to the routing
+// table. The node ID is always the TLS-authenticated one.
+//
+// For a connection we dialed, the dialed address is verified, so the node
+// is added directly. For an inbound connection the address is the IP
+// observed on the socket plus the listen port the peer advertises (the
+// only self-reported field we use: trusting a self-reported IP would let
+// a peer point other nodes at arbitrary hosts), and it is only added
+// after we dial it back successfully (see verifyInbound).
 func (s *Service) trackPeer(conn *network.Connection, listenPort uint32) Node {
 	peerID := conn.PeerID()
-	ip, _ := splitHostPort(conn.RemoteAddr().String())
-	node := Node{ID: peerID, IP: ip, Port: int(listenPort)}
-	if listenPort == 0 || listenPort > 65535 {
-		node.Port = 0
+	ip, portStr := splitHostPort(conn.RemoteAddr().String())
+
+	if conn.Outbound() {
+		port, _ := strconv.Atoi(portStr)
+		node := Node{ID: peerID, IP: ip, Port: port}
+		s.addVerified(node)
 		return node
 	}
-	s.table.AddNode(node)
+
+	if listenPort == 0 || listenPort > 65535 {
+		return Node{ID: peerID, IP: ip}
+	}
+	node := Node{ID: peerID, IP: ip, Port: int(listenPort)}
+	if existing, ok := s.table.FindNode(peerID); ok && existing.Endpoint() == node.Endpoint() {
+		s.table.Touch(peerID)
+	} else {
+		s.verifyInbound(node)
+	}
 	return node
+}
+
+// addVerified adds a verified node to the routing table. If its bucket is
+// full, the bucket's oldest node is pinged in the background and only
+// replaced if it does not answer.
+func (s *Service) addVerified(node Node) {
+	res, oldest := s.table.AddNode(node)
+	if res != BucketFull {
+		return
+	}
+
+	s.pendingMu.Lock()
+	if s.pendingEvict[oldest.ID] {
+		s.pendingMu.Unlock()
+		return
+	}
+	s.pendingEvict[oldest.ID] = true
+	s.pendingMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.pendingMu.Lock()
+			delete(s.pendingEvict, oldest.ID)
+			s.pendingMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		if _, err := s.query(ctx, oldest, protocol.MessageType_MSG_DHT_PING, ""); err != nil {
+			s.table.Replace(oldest, node)
+		} else {
+			s.table.Touch(oldest.ID)
+		}
+	}()
+}
+
+// verifyInbound dials node's advertised address with its ID pinned and,
+// if it answers a PING, adds it to the routing table. The dialed
+// connection is kept in the pool.
+func (s *Service) verifyInbound(node Node) {
+	s.pendingMu.Lock()
+	if s.pendingVerify[node.ID] {
+		s.pendingMu.Unlock()
+		return
+	}
+	select {
+	case s.verifySem <- struct{}{}:
+	default:
+		// Too many verifications in flight; the peer will be retried on
+		// its next request.
+		s.pendingMu.Unlock()
+		return
+	}
+	s.pendingVerify[node.ID] = true
+	s.pendingMu.Unlock()
+
+	go func() {
+		defer func() {
+			<-s.verifySem
+			s.pendingMu.Lock()
+			delete(s.pendingVerify, node.ID)
+			s.pendingMu.Unlock()
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
+		defer cancel()
+		conn, err := network.Dial(ctx, node.Endpoint(), s.id.ClientTLSConfig(node.ID))
+		if err != nil {
+			return
+		}
+		conn.SetRouter(s.router)
+		conn.Start()
+		s.pool.add(conn)
+		// The PING's response is handled by trackPeer, which adds the
+		// node now that the connection is outbound.
+		_, _ = s.sendDHTRequest(ctx, conn, protocol.MessageType_MSG_DHT_PING, "")
+	}()
 }
 
 // bootstrapLoop periodically connects to bootstrap peers to stay
@@ -314,12 +423,6 @@ func (s *Service) bootstrapOnce() {
 		if err != nil {
 			log.Printf("[DHT] bootstrap FIND_NODE to %s: %v", addr, err)
 			continue
-		}
-
-		for _, n := range resp.CloserPeers {
-			if node, ok := nodeFromWire(n); ok {
-				s.table.AddNode(node)
-			}
 		}
 
 		log.Printf("[DHT] Bootstrap %s returned %d peers", addr, len(resp.CloserPeers))

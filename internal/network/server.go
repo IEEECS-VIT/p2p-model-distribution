@@ -228,5 +228,7 @@ func Dial(ctx context.Context, addr string, tlsConfig *tls.Config) (*Connection,
 		tlsConn.Close()
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
-	return NewConnection(tlsConn, peerID), nil
+	conn := NewConnection(tlsConn, peerID)
+	conn.outbound = true
+	return conn, nil
 }

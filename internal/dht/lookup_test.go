@@ -4,6 +4,9 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
+	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
 )
 
 // startService starts a service on loopback and, if bootstrap is given,
@@ -76,5 +79,46 @@ func TestLookup_ReturnsClosestNodes(t *testing.T) {
 	closest, _ := all[0].lookup(ctx, target, false, 0)
 	if len(closest) == 0 || closest[0].ID != target {
 		t.Fatalf("lookup(%s) closest = %+v, want the target node first", target, closest)
+	}
+}
+
+// TestService_InboundPeersNeedVerifiedAddress checks that a peer that
+// connects to us and advertises a listen port it is not actually serving
+// on never enters the routing table, while a genuine peer does.
+func TestService_InboundPeersNeedVerifiedAddress(t *testing.T) {
+	s := startService(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// A client with no listener claims port 1.
+	liar := newTestIdentity(t)
+	conn, err := network.Dial(ctx, s.Self().Endpoint(), liar.ClientTLSConfig(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Start()
+	defer conn.Close()
+	if _, err := conn.SendRequest(ctx, protocol.MessageType_MSG_DHT_PING, &protocol.DHTRequest{ListenPort: 1}); err != nil {
+		t.Fatalf("PING: %v", err)
+	}
+
+	// A real node pings us.
+	honest := startService(t)
+	if _, err := honest.query(ctx, s.Self(), protocol.MessageType_MSG_DHT_PING, ""); err != nil {
+		t.Fatalf("honest PING: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := s.table.FindNode(honest.Self().ID); ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, ok := s.table.FindNode(honest.Self().ID); !ok {
+		t.Fatal("verified inbound peer was not added to the routing table")
+	}
+	if _, ok := s.table.FindNode(liar.ID()); ok {
+		t.Fatal("peer with an unreachable advertised address entered the routing table")
 	}
 }
