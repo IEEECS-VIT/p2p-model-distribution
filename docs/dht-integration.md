@@ -187,7 +187,7 @@ func (s *Service) Send(to string, msg []byte) error
 
 ## 5. Unified Node CLI (`cmd/node/main.go`)
 
-This is the primary entry point that integrates DHT with file transfer over TCP. It replaces the need for the standalone HTTP seeder when P2P discovery is required.
+This is the primary entry point that integrates DHT with file transfer over TCP.
 
 ### 5.1 Flags
 
@@ -475,7 +475,7 @@ Expected output:
 
 ```bash
 go test ./internal/dht/... -v
-go test ./internal/seeder/... -v
+go test ./... -v
 go test ./internal/network/... -v
 ```
 

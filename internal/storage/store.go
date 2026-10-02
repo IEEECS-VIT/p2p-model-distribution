@@ -16,25 +16,11 @@ type Store struct {
 	layout *Layout
 }
 
-// ChunkStore stores chunks in a CID-scoped layout.
-type ChunkStore struct {
-	BaseDir string
-}
-
 // NewStore creates a new Store instance with the given base directory.
 func NewStore(baseDir string) *Store {
 	return &Store{
 		layout: NewLayout(baseDir),
 	}
-}
-
-// NewChunkStore creates a ChunkStore instance with the given base directory.
-func NewChunkStore(baseDir string) (*ChunkStore, error) {
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		return nil, err
-	}
-
-	return &ChunkStore{BaseDir: baseDir}, nil
 }
 
 // Layout returns the underlying storage layout configuration.
@@ -129,37 +115,6 @@ func (s *Store) ReadChunk(fileID string, index int) ([]byte, error) {
 
 	chunkPath := filepath.Join(s.layout.ChunksDir(fileID), fmt.Sprintf("%d.chunk", index))
 	return os.ReadFile(chunkPath)
-}
-
-// ReadChunk reads a chunk from a CID-scoped chunk store.
-func (s *ChunkStore) ReadChunk(cid string, index int) ([]byte, error) {
-	path := filepath.Join(s.BaseDir, cid, fmt.Sprintf("%d.chunk", index))
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read chunk %s/%d: %w", cid, index, err)
-	}
-	return data, nil
-}
-
-// WriteChunk writes a chunk to a CID-scoped chunk store.
-func (s *ChunkStore) WriteChunk(cid string, index int, data []byte) error {
-	dir := filepath.Join(s.BaseDir, cid)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	path := filepath.Join(dir, fmt.Sprintf("%d.chunk", index))
-	tmpPath := path + ".tmp"
-
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return fmt.Errorf("write tmp chunk %d: %w", index, err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename chunk %d: %w", index, err)
-	}
-
-	return nil
 }
 
 // WriteChunksFromReader splits a stream into chunk files and stores them directly to disk.

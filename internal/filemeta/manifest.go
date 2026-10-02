@@ -115,13 +115,6 @@ func LoadManifest(path string) (FileMeta, error) {
 	return meta, err
 }
 
-// LoadManifestBytes returns the raw JSON bytes of a manifest file.
-// Use this when you need to serve the manifest over HTTP without
-// round-tripping through unmarshal → marshal.
-func LoadManifestBytes(path string) ([]byte, error) {
-	return os.ReadFile(path)
-}
-
 func GenerateManifestCID(meta FileMeta) (string, error) {
 	// Use only content-identifying fields to compute the CID.
 	// This ensures that the CID is identical for the same content, even if CreatedAt,
