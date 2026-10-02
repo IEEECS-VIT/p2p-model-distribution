@@ -1,6 +1,9 @@
 package filemeta
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestFileMetaValidateRejectsMalformedManifests reproduces the manifests a
 // malicious/compromised provider could send: before Validate() existed, a
@@ -14,11 +17,16 @@ func TestFileMetaValidateRejectsMalformedManifests(t *testing.T) {
 	}{
 		{
 			name: "negative num_chunks",
-			meta: FileMeta{NumChunks: -1, Chunks: nil},
+			meta: FileMeta{FileName: "m.bin", NumChunks: -1, Chunks: nil},
+		},
+		{
+			name: "path traversal in file name",
+			meta: FileMeta{FileName: "../../home/user/.bashrc"},
 		},
 		{
 			name: "num_chunks exceeds chunks length",
 			meta: FileMeta{
+				FileName:  "m.bin",
 				NumChunks: 5,
 				Chunks:    []ChunkMeta{{Index: 0, Hash: "sha256:abc", Size: 1}},
 			},
@@ -26,6 +34,7 @@ func TestFileMetaValidateRejectsMalformedManifests(t *testing.T) {
 		{
 			name: "num_chunks less than chunks length",
 			meta: FileMeta{
+				FileName:  "m.bin",
 				NumChunks: 1,
 				Chunks: []ChunkMeta{
 					{Index: 0, Hash: "sha256:abc", Size: 1},
@@ -36,6 +45,7 @@ func TestFileMetaValidateRejectsMalformedManifests(t *testing.T) {
 		{
 			name: "chunk index out of order",
 			meta: FileMeta{
+				FileName:  "m.bin",
 				NumChunks: 2,
 				Chunks: []ChunkMeta{
 					{Index: 1, Hash: "sha256:abc", Size: 1},
@@ -46,6 +56,7 @@ func TestFileMetaValidateRejectsMalformedManifests(t *testing.T) {
 		{
 			name: "chunk missing hash",
 			meta: FileMeta{
+				FileName:  "m.bin",
 				NumChunks: 1,
 				Chunks:    []ChunkMeta{{Index: 0, Hash: "", Size: 1}},
 			},
@@ -63,6 +74,7 @@ func TestFileMetaValidateRejectsMalformedManifests(t *testing.T) {
 
 func TestFileMetaValidateAcceptsWellFormedManifest(t *testing.T) {
 	meta := FileMeta{
+		FileName:  "model.bin",
 		NumChunks: 2,
 		Chunks: []ChunkMeta{
 			{Index: 0, Hash: "sha256:abc", Size: 1},
@@ -75,8 +87,37 @@ func TestFileMetaValidateAcceptsWellFormedManifest(t *testing.T) {
 }
 
 func TestFileMetaValidateAcceptsEmptyManifest(t *testing.T) {
-	meta := FileMeta{NumChunks: 0, Chunks: nil}
+	meta := FileMeta{FileName: "empty.bin", NumChunks: 0, Chunks: nil}
 	if err := meta.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil for empty manifest", err)
+	}
+}
+
+func TestValidateFileName(t *testing.T) {
+	bad := []string{
+		"",
+		".",
+		"..",
+		"../evil",
+		"a/b",
+		`a\b`,
+		"/etc/passwd",
+		`C:evil`,
+		"nul\x00byte",
+		"bell\x07",
+		"bad\xffutf8",
+		strings.Repeat("a", 256),
+	}
+	for _, name := range bad {
+		if err := ValidateFileName(name); err == nil {
+			t.Errorf("ValidateFileName(%q) = nil, want error", name)
+		}
+	}
+
+	good := []string{"model.bin", "llama-3 8B.gguf", ".hidden", "模型.safetensors"}
+	for _, name := range good {
+		if err := ValidateFileName(name); err != nil {
+			t.Errorf("ValidateFileName(%q) = %v, want nil", name, err)
+		}
 	}
 }

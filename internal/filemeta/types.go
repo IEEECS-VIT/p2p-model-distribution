@@ -30,6 +30,9 @@ type FileMeta struct {
 // (e.g. a manifest fetched from a remote peer) before use, since a
 // mismatched NumChunks/Chunks would otherwise panic on index access.
 func (m FileMeta) Validate() error {
+	if err := ValidateFileName(m.FileName); err != nil {
+		return fmt.Errorf("invalid manifest: %w", err)
+	}
 	if m.NumChunks < 0 {
 		return fmt.Errorf("invalid manifest: negative num_chunks %d", m.NumChunks)
 	}

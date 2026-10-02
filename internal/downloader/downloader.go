@@ -168,6 +168,12 @@ func (d *Downloader) Download(ctx context.Context, outPath string) (filemeta.Fil
 	}
 
 	if outPath == "" {
+		// meta.FileName comes from a remote peer; Validate() already
+		// rejected names that could escape the target directory, but
+		// re-check here since this is where the name becomes a path.
+		if err := filemeta.ValidateFileName(meta.FileName); err != nil {
+			return filemeta.FileMeta{}, fmt.Errorf("unsafe file name in manifest: %w", err)
+		}
 		outPath = filepath.Join(os.TempDir(), meta.FileName)
 	}
 
