@@ -7,7 +7,7 @@ import (
 )
 
 // TestRoutingTableConcurrentAccess reproduces concurrent AddNode/ClosestNodes/
-// FindNode calls, mirroring how DHT RPC handlers and resolvePeer/ResolvePeerID
+// FindNode calls, mirroring how DHT RPC handlers
 // touch the routing table from per-connection goroutines. Before locking was
 // added this raced on Bucket.Peers under `go test -race`.
 func TestRoutingTableConcurrentAccess(t *testing.T) {

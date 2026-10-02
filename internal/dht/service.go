@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/identity"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/network"
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/protocol"
+	"google.golang.org/protobuf/proto"
 )
 
 // Service integrates the DHT layer with the TCP network layer.
@@ -20,7 +22,8 @@ import (
 type Service struct {
 	id       *identity.Identity
 	self     Node
-	dht      *DHT
+	table    *RoutingTable
+	store    *ProviderStore
 	server   *network.Server
 	router   *network.Router
 	listen   string
@@ -43,16 +46,13 @@ type Service struct {
 func NewService(id *identity.Identity, listen, external string, seeds []string) *Service {
 	self := Node{ID: id.ID(), IP: extractIP(external, listen), Port: extractPort(external, listen)}
 
-	d := NewDHT(self)
-	router := network.NewRouter()
-	srv := network.NewServer(listen, id.ServerTLSConfig())
-
 	return &Service{
 		id:        id,
 		self:      self,
-		dht:       d,
-		server:    srv,
-		router:    router,
+		table:     NewRoutingTable(self.ID),
+		store:     NewStore(),
+		server:    network.NewServer(listen, id.ServerTLSConfig()),
+		router:    network.NewRouter(),
 		listen:    listen,
 		external:  external,
 		conns:     make(map[string]*network.Connection),
@@ -63,9 +63,6 @@ func NewService(id *identity.Identity, listen, external string, seeds []string) 
 
 // Self returns this node's identity.
 func (s *Service) Self() Node { return s.self }
-
-// DHT returns the underlying DHT instance.
-func (s *Service) DHT() *DHT { return s.dht }
 
 // Router returns the network router so callers can register
 // non-DHT handlers (e.g. metadata/chunk handlers).
@@ -80,11 +77,10 @@ func (s *Service) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 
-	// Register DHT message handlers
 	s.registerHandlers()
 
-	// Wire up new-connection callback: every new TCP connection
-	// gets our router so it can handle both DHT and file-transfer RPCs.
+	// Every inbound connection gets our router so it can handle both DHT
+	// and file-transfer RPCs.
 	s.server.OnNewConnection = func(conn *network.Connection) {
 		conn.SetRouter(s.router)
 		conn.Start()
@@ -95,17 +91,13 @@ func (s *Service) Start() error {
 	}
 
 	// Update self port if it was ephemeral
-	if addr, ok := s.server.Addr().(*net.TCPAddr); ok {
+	if addr, ok := s.server.Addr().(*net.TCPAddr); ok && s.external == "" {
 		s.self.Port = addr.Port
-		if s.dht != nil {
-			s.dht.Self.Port = addr.Port
-		}
 	}
 
 	log.Printf("[DHT] Node %s listening on %s (advertised: %s:%d)",
 		s.self.ID, s.listen, s.self.IP, s.self.Port)
 
-	// Bootstrap to the DHT network in the background.
 	if len(s.bootstrap) > 0 {
 		go s.bootstrapLoop(ctx)
 	}
@@ -130,13 +122,11 @@ func (s *Service) Stop() {
 //---------------------------------------------------------------------
 // Provider API
 
-// AnnounceProvider records this node as a provider for the given key
-// (typically a file ID or chunk hash) in the local DHT store and
-// propagates a STORE message to nearby peers so the record spreads.
+// AnnounceProvider records this node as a provider for key in the local
+// store and sends ADD_PROVIDER to every connected peer.
 func (s *Service) AnnounceProvider(key string) int {
-	s.dht.RecordProvider(key, s.self.ID)
+	s.store.Add(key, s.self.ID)
 
-	// Propagate to every connected peer so the record spreads.
 	s.mu.RLock()
 	peers := make([]*network.Connection, 0, len(s.conns))
 	for _, c := range s.conns {
@@ -146,16 +136,9 @@ func (s *Service) AnnounceProvider(key string) int {
 
 	for _, c := range peers {
 		go func(conn *network.Connection) {
-			body := &protocol.DHTMessageBody{
-				Type:     "STORE",
-				FromID:   s.self.ID,
-				FromIP:   s.self.IP,
-				FromPort: s.self.Port,
-				Key:      key,
-			}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_, _ = s.sendDHTRequest(ctx, conn, protocol.MSG_DHT_STORE, body)
+			_, _ = s.sendDHTRequest(ctx, conn, protocol.MessageType_MSG_DHT_ADD_PROVIDER, key)
 		}(c)
 	}
 	return len(peers)
@@ -168,27 +151,17 @@ func (s *Service) ConnectedPeersCount() int {
 	return len(s.conns)
 }
 
-// FindProviders queries connected peers for providers of the given key.
-// It first checks the local provider store, then sends FIND_VALUE
-// queries to the closest known peers from the routing table.
+// FindProviders returns provider IDs for key from the local store and
+// from FIND_VALUE queries to the closest connected peers.
 func (s *Service) FindProviders(ctx context.Context, key string) []string {
-	// Check local store first.
-	local := s.dht.ProvidersFor(key)
+	local := s.store.Get(key)
 	seen := make(map[string]bool)
 	for _, p := range local {
 		seen[p] = true
 	}
 	providers := append([]string(nil), local...)
 
-	// Query closest peers from routing table.
-	s.mu.RLock()
-	closest := s.dht.ClosestPeers(key, K)
-	s.mu.RUnlock()
-
-	for _, peer := range closest {
-		if seen[peer.ID] {
-			continue
-		}
+	for _, peer := range s.table.ClosestNodes(key, K) {
 		s.mu.RLock()
 		conn, ok := s.conns[peer.ID]
 		s.mu.RUnlock()
@@ -196,30 +169,23 @@ func (s *Service) FindProviders(ctx context.Context, key string) []string {
 			continue
 		}
 
-		body := &protocol.DHTMessageBody{
-			Type:     "FIND_VALUE",
-			FromID:   s.self.ID,
-			FromIP:   s.self.IP,
-			FromPort: s.self.Port,
-			Key:      key,
-		}
-
 		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		resp, err := s.sendDHTRequest(reqCtx, conn, protocol.MSG_DHT_FIND_VALUE, body)
+		resp, err := s.sendDHTRequest(reqCtx, conn, protocol.MessageType_MSG_DHT_FIND_VALUE, key)
 		cancel()
 		if err != nil {
 			continue
 		}
 
 		for _, p := range resp.Providers {
-			if !seen[p] {
-				seen[p] = true
-				providers = append(providers, p)
+			if !seen[p.Id] {
+				seen[p.Id] = true
+				providers = append(providers, p.Id)
 			}
 		}
-		// Add returned nodes to routing table.
-		for _, n := range resp.Nodes {
-			s.dht.AddPeer(Node{ID: n.ID, IP: n.IP, Port: n.Port})
+		for _, n := range resp.CloserPeers {
+			if node, ok := nodeFromWire(n); ok {
+				s.table.AddNode(node)
+			}
 		}
 	}
 
@@ -245,12 +211,9 @@ func (s *Service) ResolvePeerID(peerID string) (string, bool) {
 		return addr, true
 	}
 
-	// Scan routing table
-	if s.dht != nil && s.dht.RoutingTable != nil {
-		if p, ok := s.dht.RoutingTable.FindNode(peerID); ok {
-			if endpoint := p.Endpoint(); endpoint != "" {
-				return endpoint, true
-			}
+	if p, ok := s.table.FindNode(peerID); ok {
+		if endpoint := p.Endpoint(); endpoint != "" {
+			return endpoint, true
 		}
 	}
 	return "", false
@@ -258,20 +221,11 @@ func (s *Service) ResolvePeerID(peerID string) (string, bool) {
 
 // QueryNodeAddress queries the DHT network for a peer ID to resolve its dialable IP and Port.
 func (s *Service) QueryNodeAddress(ctx context.Context, targetID string) (string, bool) {
-	// 1. Check local cache/routing table first
 	if addr, ok := s.ResolvePeerID(targetID); ok && addr != "" {
 		return addr, true
 	}
 
-	// 2. Query closest peers for the target ID
-	s.mu.RLock()
-	closest := s.dht.ClosestPeers(targetID, K)
-	s.mu.RUnlock()
-
-	for _, peer := range closest {
-		if peer.ID == s.self.ID {
-			continue
-		}
+	for _, peer := range s.table.ClosestNodes(targetID, K) {
 		s.mu.RLock()
 		conn, ok := s.conns[peer.ID]
 		s.mu.RUnlock()
@@ -279,30 +233,21 @@ func (s *Service) QueryNodeAddress(ctx context.Context, targetID string) (string
 			continue
 		}
 
-		body := &protocol.DHTMessageBody{
-			Type:     "FIND_NODE",
-			FromID:   s.self.ID,
-			FromIP:   s.self.IP,
-			FromPort: s.self.Port,
-			TargetID: targetID,
-		}
-
 		reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		resp, err := s.sendDHTRequest(reqCtx, conn, protocol.MSG_DHT_FIND_NODE, body)
+		resp, err := s.sendDHTRequest(reqCtx, conn, protocol.MessageType_MSG_DHT_FIND_NODE, targetID)
 		cancel()
 		if err != nil {
 			continue
 		}
 
-		// Look through the returned nodes to find the targetID
-		for _, n := range resp.Nodes {
-			// Add to local routing table so we store the address
-			s.dht.AddPeer(Node{ID: n.ID, IP: n.IP, Port: n.Port})
-			if n.ID == targetID {
-				endpoint := fmt.Sprintf("%s:%d", n.IP, n.Port)
-				if n.IP != "" && n.Port != 0 {
-					return endpoint, true
-				}
+		for _, n := range resp.CloserPeers {
+			node, ok := nodeFromWire(n)
+			if !ok {
+				continue
+			}
+			s.table.AddNode(node)
+			if node.ID == targetID {
+				return node.Endpoint(), true
 			}
 		}
 	}
@@ -312,7 +257,6 @@ func (s *Service) QueryNodeAddress(ctx context.Context, targetID string) (string
 
 // GetConnection returns (or creates) a connection to a peer by address.
 func (s *Service) GetConnection(addr string) (*network.Connection, error) {
-	// Fast path: check existing connections.
 	s.mu.RLock()
 	for _, c := range s.conns {
 		if c.RemoteAddr().String() == addr {
@@ -329,34 +273,28 @@ func (s *Service) GetConnection(addr string) (*network.Connection, error) {
 	conn.SetRouter(s.router)
 	conn.Start()
 
-	// Send a handshake / identity exchange so the remote peer knows who we are.
-	// For now we simply track the connection.
 	s.mu.Lock()
-	s.conns[addr] = conn // key by addr until we learn the peer ID
+	s.conns[conn.PeerID()] = conn
 	s.mu.Unlock()
 
 	return conn, nil
 }
 
-func (s *Service) sendDHTRequest(ctx context.Context, conn *network.Connection, msgType protocol.MessageType, body *protocol.DHTMessageBody) (*protocol.DHTMessageBody, error) {
-	payload, err := protocol.MarshalDHTMessage(body)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	respEnv, err := conn.SendRaw(ctx, msgType, payload)
+func (s *Service) sendDHTRequest(ctx context.Context, conn *network.Connection, msgType protocol.MessageType, key string) (*protocol.DHTResponse, error) {
+	req := &protocol.DHTRequest{ListenPort: uint32(s.self.Port), Key: key}
+	respEnv, err := conn.SendRequest(ctx, msgType, req)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := protocol.UnmarshalDHTMessage(respEnv.Payload)
-	if err != nil {
+	resp := &protocol.DHTResponse{}
+	if err := proto.Unmarshal(respEnv.Payload, resp); err != nil {
 		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
 
 	// The responder's identity comes from the TLS handshake, never from
 	// self-reported fields in the message body.
-	s.trackPeer(conn, resp.FromPort)
+	s.trackPeer(conn, resp.ListenPort)
 
 	return resp, nil
 }
@@ -365,57 +303,48 @@ func (s *Service) sendDHTRequest(ctx context.Context, conn *network.Connection, 
 // Internal
 
 func (s *Service) registerHandlers() {
-	s.router.Register(protocol.MSG_DHT_PING, s.handleDHTMessage)
-	s.router.Register(protocol.MSG_DHT_FIND_NODE, s.handleDHTMessage)
-	s.router.Register(protocol.MSG_DHT_FIND_VALUE, s.handleDHTMessage)
-	s.router.Register(protocol.MSG_DHT_STORE, s.handleDHTMessage)
+	s.router.Register(protocol.MessageType_MSG_DHT_PING, s.dhtHandler(protocol.MessageType_MSG_DHT_PONG, nil))
+	s.router.Register(protocol.MessageType_MSG_DHT_FIND_NODE, s.dhtHandler(protocol.MessageType_MSG_DHT_FIND_NODE_RESPONSE, s.handleFindNode))
+	s.router.Register(protocol.MessageType_MSG_DHT_FIND_VALUE, s.dhtHandler(protocol.MessageType_MSG_DHT_FIND_VALUE_RESPONSE, s.handleFindValue))
+	s.router.Register(protocol.MessageType_MSG_DHT_ADD_PROVIDER, s.dhtHandler(protocol.MessageType_MSG_DHT_ADD_PROVIDER_RESPONSE, s.handleAddProvider))
 }
 
-func (s *Service) handleDHTMessage(conn *network.Connection, env *protocol.Envelope) error {
-	body, err := protocol.UnmarshalDHTMessage(env.Payload)
-	if err != nil {
-		return fmt.Errorf("unmarshal DHT message: %w", err)
-	}
+// dhtHandler decodes a DHTRequest, records the sender, runs handle (if
+// non-nil) to fill in the response, and writes it back as respType.
+func (s *Service) dhtHandler(respType protocol.MessageType, handle func(from Node, req *protocol.DHTRequest, resp *protocol.DHTResponse)) network.HandlerFunc {
+	return func(conn *network.Connection, env *protocol.Envelope) error {
+		req := &protocol.DHTRequest{}
+		if err := proto.Unmarshal(env.Payload, req); err != nil {
+			return fmt.Errorf("%w: malformed DHT request", network.ErrBadRequest)
+		}
 
-	// The sender's identity comes from the TLS handshake, never from
-	// self-reported fields in the message body.
-	req := Message{
-		Type:     body.Type,
-		TargetID: body.TargetID,
-		Key:      body.Key,
-		Value:    body.Value,
-		From:     s.trackPeer(conn, body.FromPort),
-		To:       s.self,
-	}
+		// The sender's identity comes from the TLS handshake, never from
+		// self-reported fields in the message body.
+		from := s.trackPeer(conn, req.ListenPort)
 
-	// Let the DHT core process it.
-	resp := s.dht.HandleMessage(req)
-
-	// Build wire response.
-	respBody := &protocol.DHTMessageBody{
-		Type:      resp.Type,
-		FromID:    s.self.ID,
-		FromIP:    s.self.IP,
-		FromPort:  s.self.Port,
-		TargetID:  resp.TargetID,
-		Key:       resp.Key,
-		Value:     resp.Value,
-		Error:     resp.Error,
-		Providers: resp.Providers,
+		resp := &protocol.DHTResponse{ListenPort: uint32(s.self.Port)}
+		if handle != nil {
+			handle(from, req, resp)
+		}
+		return conn.WriteResponse(env.Id, respType, resp)
 	}
-	for _, n := range resp.Nodes {
-		respBody.Nodes = append(respBody.Nodes, protocol.DHTNode{
-			ID: n.ID, IP: n.IP, Port: n.Port,
-		})
-	}
+}
 
-	respPayload, err := protocol.MarshalDHTMessage(respBody)
-	if err != nil {
-		return fmt.Errorf("marshal DHT response: %w", err)
-	}
+func (s *Service) handleFindNode(_ Node, req *protocol.DHTRequest, resp *protocol.DHTResponse) {
+	resp.CloserPeers = nodesToWire(s.table.ClosestNodes(req.Key, K))
+}
 
-	respType := protocol.ResponseMessageType(body.Type)
-	return conn.WriteRawResponse(env.Id, respType, respPayload)
+func (s *Service) handleFindValue(_ Node, req *protocol.DHTRequest, resp *protocol.DHTResponse) {
+	resp.CloserPeers = nodesToWire(s.table.ClosestNodes(req.Key, K))
+	for _, id := range s.store.Get(req.Key) {
+		resp.Providers = append(resp.Providers, &protocol.DHTPeer{Id: id})
+	}
+}
+
+func (s *Service) handleAddProvider(from Node, req *protocol.DHTRequest, _ *protocol.DHTResponse) {
+	if req.Key != "" {
+		s.store.Add(req.Key, from.ID)
+	}
 }
 
 // trackPeer records conn under the peer's authenticated node ID and adds
@@ -423,7 +352,7 @@ func (s *Service) handleDHTMessage(conn *network.Connection, env *protocol.Envel
 // the socket plus the listen port it advertises (the only self-reported
 // field we use): trusting a self-reported IP would let a peer point other
 // nodes at arbitrary third-party hosts.
-func (s *Service) trackPeer(conn *network.Connection, listenPort int) Node {
+func (s *Service) trackPeer(conn *network.Connection, listenPort uint32) Node {
 	peerID := conn.PeerID()
 
 	s.mu.Lock()
@@ -437,9 +366,9 @@ func (s *Service) trackPeer(conn *network.Connection, listenPort int) Node {
 	s.mu.Unlock()
 
 	ip, _ := splitHostPort(conn.RemoteAddr().String())
-	node := Node{ID: peerID, IP: ip, Port: listenPort}
+	node := Node{ID: peerID, IP: ip, Port: int(listenPort)}
 	if listenPort > 0 && listenPort <= 65535 {
-		s.dht.AddPeer(node)
+		s.table.AddNode(node)
 		s.AddPeerAddr(peerID, node.Endpoint())
 	}
 	return node
@@ -451,7 +380,6 @@ func (s *Service) bootstrapLoop(ctx context.Context) {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
-	// Initial bootstrap immediately.
 	s.bootstrapOnce()
 
 	for {
@@ -472,36 +400,44 @@ func (s *Service) bootstrapOnce() {
 			continue
 		}
 
-		// Send a FIND_NODE for our own ID to discover peers.
-		body := &protocol.DHTMessageBody{
-			Type:     "FIND_NODE",
-			FromID:   s.self.ID,
-			FromIP:   s.self.IP,
-			FromPort: s.self.Port,
-			TargetID: s.self.ID,
-		}
-
+		// Look up our own ID to discover peers near us.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		resp, err := s.sendDHTRequest(ctx, conn, protocol.MSG_DHT_FIND_NODE, body)
+		resp, err := s.sendDHTRequest(ctx, conn, protocol.MessageType_MSG_DHT_FIND_NODE, s.self.ID)
 		cancel()
 		if err != nil {
 			log.Printf("[DHT] bootstrap FIND_NODE to %s: %v", addr, err)
 			continue
 		}
 
-		// Add returned nodes to routing table and store their addresses.
-		for _, n := range resp.Nodes {
-			s.dht.AddPeer(Node{ID: n.ID, IP: n.IP, Port: n.Port})
-			peerAddr := fmt.Sprintf("%s:%d", n.IP, n.Port)
-			s.AddPeerAddr(n.ID, peerAddr)
+		for _, n := range resp.CloserPeers {
+			if node, ok := nodeFromWire(n); ok {
+				s.table.AddNode(node)
+				s.AddPeerAddr(node.ID, node.Endpoint())
+			}
 		}
 
-		log.Printf("[DHT] Bootstrap %s returned %d peers", addr, len(resp.Nodes))
+		log.Printf("[DHT] Bootstrap %s returned %d peers", addr, len(resp.CloserPeers))
 	}
 }
 
 //---------------------------------------------------------------------
 // Helpers
+
+// nodeFromWire converts and validates a peer received from the network.
+func nodeFromWire(p *protocol.DHTPeer) (Node, bool) {
+	if p == nil || !identity.ValidID(p.Id) || net.ParseIP(p.Ip) == nil || p.Port == 0 || p.Port > 65535 {
+		return Node{}, false
+	}
+	return Node{ID: p.Id, IP: p.Ip, Port: int(p.Port)}, true
+}
+
+func nodesToWire(nodes []Node) []*protocol.DHTPeer {
+	out := make([]*protocol.DHTPeer, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, &protocol.DHTPeer{Id: n.ID, Ip: n.IP, Port: uint32(n.Port)})
+	}
+	return out
+}
 
 func extractIP(external, listen string) string {
 	if external != "" {
@@ -523,8 +459,7 @@ func extractPort(external, listen string) int {
 		addr = external
 	}
 	_, portStr := splitHostPort(addr)
-	var port int
-	_, _ = fmt.Sscanf(portStr, "%d", &port)
+	port, _ := strconv.Atoi(portStr)
 	if port == 0 {
 		port = 9000
 	}

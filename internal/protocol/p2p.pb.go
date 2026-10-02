@@ -31,16 +31,16 @@ const (
 	MessageType_MSG_GET_METADATA_RESPONSE MessageType = 4
 	MessageType_MSG_GET_CHUNK_REQUEST     MessageType = 5
 	MessageType_MSG_GET_CHUNK_RESPONSE    MessageType = 6
-	// DHT protocol messages (7-14) — defined in internal/protocol/dht.go
-	// MSG_DHT_PING             = 7;
-	// MSG_DHT_PONG             = 8;
-	// MSG_DHT_FIND_NODE        = 9;
-	// MSG_DHT_FIND_NODE_RESP   = 10;
-	// MSG_DHT_FIND_VALUE       = 11;
-	// MSG_DHT_FIND_VALUE_RESP  = 12;
-	// MSG_DHT_STORE            = 13;
-	// MSG_DHT_STORE_RESP       = 14;
-	MessageType_MSG_ERROR MessageType = 15 // generic error response to any request
+	// DHT RPCs: requests carry a DHTRequest, responses a DHTResponse.
+	MessageType_MSG_DHT_PING                  MessageType = 7
+	MessageType_MSG_DHT_PONG                  MessageType = 8
+	MessageType_MSG_DHT_FIND_NODE             MessageType = 9
+	MessageType_MSG_DHT_FIND_NODE_RESPONSE    MessageType = 10
+	MessageType_MSG_DHT_FIND_VALUE            MessageType = 11
+	MessageType_MSG_DHT_FIND_VALUE_RESPONSE   MessageType = 12
+	MessageType_MSG_DHT_ADD_PROVIDER          MessageType = 13
+	MessageType_MSG_DHT_ADD_PROVIDER_RESPONSE MessageType = 14
+	MessageType_MSG_ERROR                     MessageType = 15 // generic error response to any request
 )
 
 // Enum value maps for MessageType.
@@ -53,17 +53,33 @@ var (
 		4:  "MSG_GET_METADATA_RESPONSE",
 		5:  "MSG_GET_CHUNK_REQUEST",
 		6:  "MSG_GET_CHUNK_RESPONSE",
+		7:  "MSG_DHT_PING",
+		8:  "MSG_DHT_PONG",
+		9:  "MSG_DHT_FIND_NODE",
+		10: "MSG_DHT_FIND_NODE_RESPONSE",
+		11: "MSG_DHT_FIND_VALUE",
+		12: "MSG_DHT_FIND_VALUE_RESPONSE",
+		13: "MSG_DHT_ADD_PROVIDER",
+		14: "MSG_DHT_ADD_PROVIDER_RESPONSE",
 		15: "MSG_ERROR",
 	}
 	MessageType_value = map[string]int32{
-		"MSG_UNKNOWN":               0,
-		"MSG_HANDSHAKE_REQUEST":     1,
-		"MSG_HANDSHAKE_RESPONSE":    2,
-		"MSG_GET_METADATA_REQUEST":  3,
-		"MSG_GET_METADATA_RESPONSE": 4,
-		"MSG_GET_CHUNK_REQUEST":     5,
-		"MSG_GET_CHUNK_RESPONSE":    6,
-		"MSG_ERROR":                 15,
+		"MSG_UNKNOWN":                   0,
+		"MSG_HANDSHAKE_REQUEST":         1,
+		"MSG_HANDSHAKE_RESPONSE":        2,
+		"MSG_GET_METADATA_REQUEST":      3,
+		"MSG_GET_METADATA_RESPONSE":     4,
+		"MSG_GET_CHUNK_REQUEST":         5,
+		"MSG_GET_CHUNK_RESPONSE":        6,
+		"MSG_DHT_PING":                  7,
+		"MSG_DHT_PONG":                  8,
+		"MSG_DHT_FIND_NODE":             9,
+		"MSG_DHT_FIND_NODE_RESPONSE":    10,
+		"MSG_DHT_FIND_VALUE":            11,
+		"MSG_DHT_FIND_VALUE_RESPONSE":   12,
+		"MSG_DHT_ADD_PROVIDER":          13,
+		"MSG_DHT_ADD_PROVIDER_RESPONSE": 14,
+		"MSG_ERROR":                     15,
 	}
 )
 
@@ -560,6 +576,183 @@ func (x *GetChunkResponse) GetError() string {
 	return ""
 }
 
+// DHTPeer is a node and the address it can be dialed at. The ID is only a
+// claim until a connection to the address authenticates it via TLS.
+type DHTPeer struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Ip            string                 `protobuf:"bytes,2,opt,name=ip,proto3" json:"ip,omitempty"`
+	Port          uint32                 `protobuf:"varint,3,opt,name=port,proto3" json:"port,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DHTPeer) Reset() {
+	*x = DHTPeer{}
+	mi := &file_proto_p2p_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DHTPeer) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DHTPeer) ProtoMessage() {}
+
+func (x *DHTPeer) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_p2p_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DHTPeer.ProtoReflect.Descriptor instead.
+func (*DHTPeer) Descriptor() ([]byte, []int) {
+	return file_proto_p2p_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *DHTPeer) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *DHTPeer) GetIp() string {
+	if x != nil {
+		return x.Ip
+	}
+	return ""
+}
+
+func (x *DHTPeer) GetPort() uint32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+// DHTRequest is the payload of every DHT request. The sender's node ID is
+// never carried in the message: it is the TLS-authenticated peer ID.
+type DHTRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ListenPort    uint32                 `protobuf:"varint,1,opt,name=listen_port,json=listenPort,proto3" json:"listen_port,omitempty"` // sender's listen port; 0 if it accepts no connections
+	Key           string                 `protobuf:"bytes,2,opt,name=key,proto3" json:"key,omitempty"`                                  // FIND_NODE target, FIND_VALUE / ADD_PROVIDER key
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DHTRequest) Reset() {
+	*x = DHTRequest{}
+	mi := &file_proto_p2p_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DHTRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DHTRequest) ProtoMessage() {}
+
+func (x *DHTRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_p2p_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DHTRequest.ProtoReflect.Descriptor instead.
+func (*DHTRequest) Descriptor() ([]byte, []int) {
+	return file_proto_p2p_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *DHTRequest) GetListenPort() uint32 {
+	if x != nil {
+		return x.ListenPort
+	}
+	return 0
+}
+
+func (x *DHTRequest) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+// DHTResponse is the payload of every DHT response.
+type DHTResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ListenPort    uint32                 `protobuf:"varint,1,opt,name=listen_port,json=listenPort,proto3" json:"listen_port,omitempty"`
+	CloserPeers   []*DHTPeer             `protobuf:"bytes,2,rep,name=closer_peers,json=closerPeers,proto3" json:"closer_peers,omitempty"` // FIND_NODE / FIND_VALUE
+	Providers     []*DHTPeer             `protobuf:"bytes,3,rep,name=providers,proto3" json:"providers,omitempty"`                        // FIND_VALUE
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DHTResponse) Reset() {
+	*x = DHTResponse{}
+	mi := &file_proto_p2p_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DHTResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DHTResponse) ProtoMessage() {}
+
+func (x *DHTResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_p2p_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DHTResponse.ProtoReflect.Descriptor instead.
+func (*DHTResponse) Descriptor() ([]byte, []int) {
+	return file_proto_p2p_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *DHTResponse) GetListenPort() uint32 {
+	if x != nil {
+		return x.ListenPort
+	}
+	return 0
+}
+
+func (x *DHTResponse) GetCloserPeers() []*DHTPeer {
+	if x != nil {
+		return x.CloserPeers
+	}
+	return nil
+}
+
+func (x *DHTResponse) GetProviders() []*DHTPeer {
+	if x != nil {
+		return x.Providers
+	}
+	return nil
+}
+
 var File_proto_p2p_proto protoreflect.FileDescriptor
 
 const file_proto_p2p_proto_rawDesc = "" +
@@ -597,7 +790,21 @@ const file_proto_p2p_proto_rawDesc = "" +
 	"chunkIndex\x12\x18\n" +
 	"\asuccess\x18\x03 \x01(\bR\asuccess\x12\x12\n" +
 	"\x04data\x18\x04 \x01(\fR\x04data\x12\x14\n" +
-	"\x05error\x18\x05 \x01(\tR\x05error*\xd8\x01\n" +
+	"\x05error\x18\x05 \x01(\tR\x05error\"=\n" +
+	"\aDHTPeer\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x0e\n" +
+	"\x02ip\x18\x02 \x01(\tR\x02ip\x12\x12\n" +
+	"\x04port\x18\x03 \x01(\rR\x04port\"?\n" +
+	"\n" +
+	"DHTRequest\x12\x1f\n" +
+	"\vlisten_port\x18\x01 \x01(\rR\n" +
+	"listenPort\x12\x10\n" +
+	"\x03key\x18\x02 \x01(\tR\x03key\"\x8b\x01\n" +
+	"\vDHTResponse\x12\x1f\n" +
+	"\vlisten_port\x18\x01 \x01(\rR\n" +
+	"listenPort\x12/\n" +
+	"\fcloser_peers\x18\x02 \x03(\v2\f.p2p.DHTPeerR\vcloserPeers\x12*\n" +
+	"\tproviders\x18\x03 \x03(\v2\f.p2p.DHTPeerR\tproviders*\xa9\x03\n" +
 	"\vMessageType\x12\x0f\n" +
 	"\vMSG_UNKNOWN\x10\x00\x12\x19\n" +
 	"\x15MSG_HANDSHAKE_REQUEST\x10\x01\x12\x1a\n" +
@@ -605,7 +812,16 @@ const file_proto_p2p_proto_rawDesc = "" +
 	"\x18MSG_GET_METADATA_REQUEST\x10\x03\x12\x1d\n" +
 	"\x19MSG_GET_METADATA_RESPONSE\x10\x04\x12\x19\n" +
 	"\x15MSG_GET_CHUNK_REQUEST\x10\x05\x12\x1a\n" +
-	"\x16MSG_GET_CHUNK_RESPONSE\x10\x06\x12\r\n" +
+	"\x16MSG_GET_CHUNK_RESPONSE\x10\x06\x12\x10\n" +
+	"\fMSG_DHT_PING\x10\a\x12\x10\n" +
+	"\fMSG_DHT_PONG\x10\b\x12\x15\n" +
+	"\x11MSG_DHT_FIND_NODE\x10\t\x12\x1e\n" +
+	"\x1aMSG_DHT_FIND_NODE_RESPONSE\x10\n" +
+	"\x12\x16\n" +
+	"\x12MSG_DHT_FIND_VALUE\x10\v\x12\x1f\n" +
+	"\x1bMSG_DHT_FIND_VALUE_RESPONSE\x10\f\x12\x18\n" +
+	"\x14MSG_DHT_ADD_PROVIDER\x10\r\x12!\n" +
+	"\x1dMSG_DHT_ADD_PROVIDER_RESPONSE\x10\x0e\x12\r\n" +
 	"\tMSG_ERROR\x10\x0fB@Z>github.com/IEEECS-VIT/p2p-model-distribution/internal/protocolb\x06proto3"
 
 var (
@@ -621,7 +837,7 @@ func file_proto_p2p_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_p2p_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_proto_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_proto_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_proto_p2p_proto_goTypes = []any{
 	(MessageType)(0),            // 0: p2p.MessageType
 	(*Envelope)(nil),            // 1: p2p.Envelope
@@ -632,14 +848,19 @@ var file_proto_p2p_proto_goTypes = []any{
 	(*GetMetadataResponse)(nil), // 6: p2p.GetMetadataResponse
 	(*GetChunkRequest)(nil),     // 7: p2p.GetChunkRequest
 	(*GetChunkResponse)(nil),    // 8: p2p.GetChunkResponse
+	(*DHTPeer)(nil),             // 9: p2p.DHTPeer
+	(*DHTRequest)(nil),          // 10: p2p.DHTRequest
+	(*DHTResponse)(nil),         // 11: p2p.DHTResponse
 }
 var file_proto_p2p_proto_depIdxs = []int32{
 	0, // 0: p2p.Envelope.type:type_name -> p2p.MessageType
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	9, // 1: p2p.DHTResponse.closer_peers:type_name -> p2p.DHTPeer
+	9, // 2: p2p.DHTResponse.providers:type_name -> p2p.DHTPeer
+	3, // [3:3] is the sub-list for method output_type
+	3, // [3:3] is the sub-list for method input_type
+	3, // [3:3] is the sub-list for extension type_name
+	3, // [3:3] is the sub-list for extension extendee
+	0, // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_proto_p2p_proto_init() }
@@ -653,7 +874,7 @@ func file_proto_p2p_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_p2p_proto_rawDesc), len(file_proto_p2p_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   8,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

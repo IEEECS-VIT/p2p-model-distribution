@@ -228,7 +228,6 @@ func (c *Connection) WriteResponse(reqID string, msgType protocol.MessageType, r
 }
 
 // WriteRawResponse writes a pre-serialised payload as a response to a request.
-// This is used by the DHT layer which uses JSON serialisation instead of protobuf.
 func (c *Connection) WriteRawResponse(reqID string, msgType protocol.MessageType, payload []byte) error {
 	env := &protocol.Envelope{
 		Id:         reqID,
@@ -245,8 +244,9 @@ func (c *Connection) WriteRawResponse(reqID string, msgType protocol.MessageType
 	return c.WriteMessage(envBytes)
 }
 
-// SendRaw sends a pre-serialised payload as a request and waits for the response envelope.
-// This is the raw-payload counterpart of SendRequest, used by the DHT layer.
+// SendRaw sends a pre-serialised payload as a request and waits for the
+// response envelope. An ErrorResponse from the peer is returned as a
+// *RemoteError.
 func (c *Connection) SendRaw(ctx context.Context, msgType protocol.MessageType, payload []byte) (*protocol.Envelope, error) {
 	reqID := generateUUID()
 
