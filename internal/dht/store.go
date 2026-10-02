@@ -5,9 +5,10 @@ import (
 	"time"
 )
 
-//store maintains provider records mapping chunk hashes to provider Node IDs.
-//It is safe for concurrent use, since it is read and written from
-//per-connection RPC handler goroutines.
+// ProviderStore maintains provider records mapping keys (file IDs) to the
+// nodes that serve them, including the address each provider can be
+// dialed at. It is safe for concurrent use, since it is read and written
+// from per-connection RPC handler goroutines.
 
 const (
 	// maxProvidersPerKey bounds how many provider records are kept for a
@@ -22,28 +23,35 @@ const (
 	maxKeys = 100_000
 )
 
-// providerTTL is how long a provider record remains valid without being
+// ProviderTTL is how long a provider record remains valid without being
 // re-announced. Expired records are pruned lazily on the next Add/Get for
 // that key, so a peer that goes offline eventually stops being handed out
-// instead of lingering forever. Var (not const) so tests can shrink it.
-var providerTTL = 30 * time.Minute
+// instead of lingering forever.
+const ProviderTTL = 30 * time.Minute
 
 type providerRecord struct {
-	id        string
+	node      Node
 	expiresAt time.Time
 }
 
 type ProviderStore struct {
 	mu   sync.Mutex
+	ttl  time.Duration
 	data map[string][]providerRecord
 }
 
 func NewStore() *ProviderStore {
-	return &ProviderStore{data: make(map[string][]providerRecord)}
+	return newStoreWithTTL(ProviderTTL)
 }
 
-func (s *ProviderStore) Add(chunk string, providerID string) {
-	if chunk == "" || providerID == "" {
+func newStoreWithTTL(ttl time.Duration) *ProviderStore {
+	return &ProviderStore{ttl: ttl, data: make(map[string][]providerRecord)}
+}
+
+// Add records provider as serving chunk, refreshing its expiry (and
+// address) if it is already recorded.
+func (s *ProviderStore) Add(chunk string, provider Node) {
+	if chunk == "" || provider.ID == "" {
 		return
 	}
 
@@ -55,8 +63,8 @@ func (s *ProviderStore) Add(chunk string, providerID string) {
 	providers := pruneExpired(s.data[chunk], now)
 
 	for i, existing := range providers {
-		if existing.id == providerID {
-			providers[i].expiresAt = now.Add(providerTTL)
+		if existing.node.ID == provider.ID {
+			providers[i] = providerRecord{node: provider, expiresAt: now.Add(s.ttl)}
 			s.data[chunk] = providers
 			return
 		}
@@ -72,10 +80,11 @@ func (s *ProviderStore) Add(chunk string, providerID string) {
 		providers = providers[1:]
 	}
 
-	s.data[chunk] = append(providers, providerRecord{id: providerID, expiresAt: now.Add(providerTTL)})
+	s.data[chunk] = append(providers, providerRecord{node: provider, expiresAt: now.Add(s.ttl)})
 }
 
-func (s *ProviderStore) Get(chunk string) []string {
+// Get returns the unexpired providers recorded for chunk.
+func (s *ProviderStore) Get(chunk string) []Node {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -86,9 +95,9 @@ func (s *ProviderStore) Get(chunk string) []string {
 	}
 	s.data[chunk] = providers
 
-	result := make([]string, len(providers))
+	result := make([]Node, len(providers))
 	for i, p := range providers {
-		result[i] = p.id
+		result[i] = p.node
 	}
 	return result
 }
@@ -100,7 +109,7 @@ func (s *ProviderStore) Remove(chunk string, providerID string) {
 	providers := s.data[chunk]
 	filtered := providers[:0]
 	for _, existing := range providers {
-		if existing.id != providerID {
+		if existing.node.ID != providerID {
 			filtered = append(filtered, existing)
 		}
 	}

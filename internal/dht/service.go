@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/IEEECS-VIT/p2p-model-distribution/internal/identity"
@@ -30,9 +29,6 @@ type Service struct {
 	external string // address we advertise to other peers ("ip:port")
 
 	pool *pool
-
-	mu    sync.RWMutex
-	addrs map[string]string // peerID -> "ip:port" for reconnecting
 
 	bootstrap []string // "ip:port" addresses of bootstrap peers
 
@@ -58,7 +54,6 @@ func NewService(id *identity.Identity, listen, external string, seeds []string) 
 		pool:      newPool(id, router),
 		listen:    listen,
 		external:  external,
-		addrs:     make(map[string]string),
 		bootstrap: seeds,
 	}
 }
@@ -123,7 +118,7 @@ func (s *Service) Stop() {
 // AnnounceProvider records this node as a provider for key in the local
 // store and sends ADD_PROVIDER to every connected peer.
 func (s *Service) AnnounceProvider(key string) int {
-	s.store.Add(key, s.self.ID)
+	s.store.Add(key, s.self)
 
 	peers := s.pool.all()
 	for _, c := range peers {
@@ -141,15 +136,21 @@ func (s *Service) ConnectedPeersCount() int {
 	return s.pool.count()
 }
 
-// FindProviders returns provider IDs for key from the local store and
-// from FIND_VALUE queries to the closest connected peers.
-func (s *Service) FindProviders(ctx context.Context, key string) []string {
-	local := s.store.Get(key)
-	seen := make(map[string]bool)
-	for _, p := range local {
-		seen[p] = true
+// FindProviders returns the providers (with addresses) known for key,
+// from the local store and from FIND_VALUE queries to the closest
+// connected peers. This node is never included.
+func (s *Service) FindProviders(ctx context.Context, key string) []Node {
+	seen := map[string]bool{s.self.ID: true}
+	var providers []Node
+	addProvider := func(n Node) {
+		if !seen[n.ID] {
+			seen[n.ID] = true
+			providers = append(providers, n)
+		}
 	}
-	providers := append([]string(nil), local...)
+	for _, p := range s.store.Get(key) {
+		addProvider(p)
+	}
 
 	for _, peer := range s.table.ClosestNodes(key, K) {
 		conn, ok := s.pool.get(peer.ID)
@@ -165,9 +166,8 @@ func (s *Service) FindProviders(ctx context.Context, key string) []string {
 		}
 
 		for _, p := range resp.Providers {
-			if !seen[p.Id] {
-				seen[p.Id] = true
-				providers = append(providers, p.Id)
+			if node, ok := nodeFromWire(p); ok {
+				addProvider(node)
 			}
 		}
 		for _, n := range resp.CloserPeers {
@@ -180,71 +180,15 @@ func (s *Service) FindProviders(ctx context.Context, key string) []string {
 	return providers
 }
 
-// AddPeerAddr registers a peer's address so the service can connect
-// to it later.  This is how we translate DHT Node IDs to dial-able
-// TCP addresses.
-func (s *Service) AddPeerAddr(peerID, addr string) {
-	s.mu.Lock()
-	s.addrs[peerID] = addr
-	s.mu.Unlock()
+// Connect returns a connection to node, dialing it if necessary. The dial
+// fails unless the remote end proves it owns node.ID.
+func (s *Service) Connect(ctx context.Context, node Node) (*network.Connection, error) {
+	return s.pool.connect(ctx, node)
 }
 
-// ResolvePeerID returns the dialable address for a peer ID by checking either the
-// registered addrs map or scanning the routing table buckets.
-func (s *Service) ResolvePeerID(peerID string) (string, bool) {
-	s.mu.RLock()
-	addr, ok := s.addrs[peerID]
-	s.mu.RUnlock()
-	if ok && addr != "" {
-		return addr, true
-	}
-
-	if p, ok := s.table.FindNode(peerID); ok {
-		if endpoint := p.Endpoint(); endpoint != "" {
-			return endpoint, true
-		}
-	}
-	return "", false
-}
-
-// QueryNodeAddress queries the DHT network for a peer ID to resolve its dialable IP and Port.
-func (s *Service) QueryNodeAddress(ctx context.Context, targetID string) (string, bool) {
-	if addr, ok := s.ResolvePeerID(targetID); ok && addr != "" {
-		return addr, true
-	}
-
-	for _, peer := range s.table.ClosestNodes(targetID, K) {
-		conn, ok := s.pool.get(peer.ID)
-		if !ok {
-			continue
-		}
-
-		reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		resp, err := s.sendDHTRequest(reqCtx, conn, protocol.MessageType_MSG_DHT_FIND_NODE, targetID)
-		cancel()
-		if err != nil {
-			continue
-		}
-
-		for _, n := range resp.CloserPeers {
-			node, ok := nodeFromWire(n)
-			if !ok {
-				continue
-			}
-			s.table.AddNode(node)
-			if node.ID == targetID {
-				return node.Endpoint(), true
-			}
-		}
-	}
-
-	return "", false
-}
-
-// GetConnection returns (or creates) a connection to whichever node
-// answers at addr.
-func (s *Service) GetConnection(addr string) (*network.Connection, error) {
-	return s.pool.connectAddr(context.Background(), addr)
+// ConnectAddr returns a connection to whichever node answers at addr.
+func (s *Service) ConnectAddr(ctx context.Context, addr string) (*network.Connection, error) {
+	return s.pool.connectAddr(ctx, addr)
 }
 
 func (s *Service) sendDHTRequest(ctx context.Context, conn *network.Connection, msgType protocol.MessageType, key string) (*protocol.DHTResponse, error) {
@@ -278,7 +222,7 @@ func (s *Service) registerHandlers() {
 
 // dhtHandler decodes a DHTRequest, records the sender, runs handle (if
 // non-nil) to fill in the response, and writes it back as respType.
-func (s *Service) dhtHandler(respType protocol.MessageType, handle func(from Node, req *protocol.DHTRequest, resp *protocol.DHTResponse)) network.HandlerFunc {
+func (s *Service) dhtHandler(respType protocol.MessageType, handle func(conn *network.Connection, from Node, req *protocol.DHTRequest, resp *protocol.DHTResponse)) network.HandlerFunc {
 	return func(conn *network.Connection, env *protocol.Envelope) error {
 		req := &protocol.DHTRequest{}
 		if err := proto.Unmarshal(env.Payload, req); err != nil {
@@ -291,27 +235,47 @@ func (s *Service) dhtHandler(respType protocol.MessageType, handle func(from Nod
 
 		resp := &protocol.DHTResponse{ListenPort: uint32(s.self.Port)}
 		if handle != nil {
-			handle(from, req, resp)
+			handle(conn, from, req, resp)
 		}
 		return conn.WriteResponse(env.Id, respType, resp)
 	}
 }
 
-func (s *Service) handleFindNode(_ Node, req *protocol.DHTRequest, resp *protocol.DHTResponse) {
+func (s *Service) handleFindNode(_ *network.Connection, _ Node, req *protocol.DHTRequest, resp *protocol.DHTResponse) {
 	resp.CloserPeers = nodesToWire(s.table.ClosestNodes(req.Key, K))
 }
 
-func (s *Service) handleFindValue(_ Node, req *protocol.DHTRequest, resp *protocol.DHTResponse) {
+func (s *Service) handleFindValue(conn *network.Connection, _ Node, req *protocol.DHTRequest, resp *protocol.DHTResponse) {
 	resp.CloserPeers = nodesToWire(s.table.ClosestNodes(req.Key, K))
-	for _, id := range s.store.Get(req.Key) {
-		resp.Providers = append(resp.Providers, &protocol.DHTPeer{Id: id})
+	providers := s.store.Get(req.Key)
+	for i, p := range providers {
+		if p.ID == s.self.ID {
+			providers[i] = s.selfAddrFor(conn)
+		}
+	}
+	resp.Providers = nodesToWire(providers)
+}
+
+// handleAddProvider records the sender as a provider for the key. A peer
+// can only announce itself, at the address we observe it on, and only if
+// it accepts connections.
+func (s *Service) handleAddProvider(_ *network.Connection, from Node, req *protocol.DHTRequest, _ *protocol.DHTResponse) {
+	if req.Key != "" && from.Port > 0 {
+		s.store.Add(req.Key, from)
 	}
 }
 
-func (s *Service) handleAddProvider(from Node, req *protocol.DHTRequest, _ *protocol.DHTResponse) {
-	if req.Key != "" {
-		s.store.Add(req.Key, from.ID)
+// selfAddrFor returns this node's address as reachable by the peer on
+// conn: the configured external address if set, otherwise the local IP
+// the peer reached us on.
+func (s *Service) selfAddrFor(conn *network.Connection) Node {
+	self := s.self
+	if s.external == "" {
+		if tcp, ok := conn.LocalAddr().(*net.TCPAddr); ok {
+			self.IP = tcp.IP.String()
+		}
 	}
+	return self
 }
 
 // trackPeer adds the peer on conn to the routing table. The peer's address is the IP observed on
@@ -322,10 +286,11 @@ func (s *Service) trackPeer(conn *network.Connection, listenPort uint32) Node {
 	peerID := conn.PeerID()
 	ip, _ := splitHostPort(conn.RemoteAddr().String())
 	node := Node{ID: peerID, IP: ip, Port: int(listenPort)}
-	if listenPort > 0 && listenPort <= 65535 {
-		s.table.AddNode(node)
-		s.AddPeerAddr(peerID, node.Endpoint())
+	if listenPort == 0 || listenPort > 65535 {
+		node.Port = 0
+		return node
 	}
+	s.table.AddNode(node)
 	return node
 }
 
@@ -349,7 +314,7 @@ func (s *Service) bootstrapLoop(ctx context.Context) {
 
 func (s *Service) bootstrapOnce() {
 	for _, addr := range s.bootstrap {
-		conn, err := s.GetConnection(addr)
+		conn, err := s.pool.connectAddr(context.Background(), addr)
 		if err != nil {
 			log.Printf("[DHT] bootstrap dial %s: %v", addr, err)
 			continue
@@ -367,7 +332,6 @@ func (s *Service) bootstrapOnce() {
 		for _, n := range resp.CloserPeers {
 			if node, ok := nodeFromWire(n); ok {
 				s.table.AddNode(node)
-				s.AddPeerAddr(node.ID, node.Endpoint())
 			}
 		}
 

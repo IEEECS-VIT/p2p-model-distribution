@@ -342,7 +342,7 @@ func runDHDownloader(ctx context.Context, fileID, outPath, dataDir string, svc *
 	defer dlCancel()
 
 	// Query DHT network for providers, retrying up to 15 seconds to allow background bootstrap connection.
-	var providers []string
+	var providers []dht.Node
 	fmt.Printf("%s[DHT]%s Querying DHT network for provider endpoints...\n", colorBlue, colorReset)
 	for i := 0; i < 15; i++ {
 		select {
@@ -360,7 +360,7 @@ func runDHDownloader(ctx context.Context, fileID, outPath, dataDir string, svc *
 foundProviders:
 	fmt.Printf("%s[DHT]%s Found %d initial provider(s)\n", colorGreen, colorReset, len(providers))
 
-	dl := downloader.New(fileID, dataDir, svc, store, providers, 4, nil)
+	dl := downloader.New(fileID, dataDir, svc, store, nil, 4, nil)
 	_, err := dl.Download(dlCtx, outPath)
 	if err != nil {
 		log.Fatalf("download failed: %v", err)

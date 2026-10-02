@@ -307,6 +307,11 @@ func (c *Connection) RemoteAddr() net.Addr {
 	return c.conn.RemoteAddr()
 }
 
+// LocalAddr returns the local network address of the connection.
+func (c *Connection) LocalAddr() net.Addr {
+	return c.conn.LocalAddr()
+}
+
 // PeerID returns the logical ID of the connected peer.
 func (c *Connection) PeerID() string {
 	return c.peerID

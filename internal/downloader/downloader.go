@@ -44,6 +44,7 @@ type Downloader struct {
 	mu               sync.Mutex
 	providerAddrs    []string
 	providerFailures map[string]int
+	providerNodes    map[string]dht.Node            // addr -> provider found via the DHT (ID is pinned when dialing)
 	connections      map[string]*network.Connection // active connections dialed locally (when svc == nil)
 }
 
@@ -62,6 +63,7 @@ func New(fileID string, dataDir string, svc *dht.Service, store *storage.Store, 
 		concurrency:      concurrency,
 		initialProviders: initialProviders,
 		providerFailures: make(map[string]int),
+		providerNodes:    make(map[string]dht.Node),
 		connections:      make(map[string]*network.Connection),
 	}
 }
@@ -69,16 +71,8 @@ func New(fileID string, dataDir string, svc *dht.Service, store *storage.Store, 
 func (d *Downloader) ResolveProviders(ctx context.Context) error {
 	var resolvedAddrs []string
 	for _, p := range d.initialProviders {
-		if p == "" {
-			continue
-		}
 		if isAddress(p) {
 			resolvedAddrs = append(resolvedAddrs, p)
-		} else if d.svc != nil {
-			addr, ok := d.svc.QueryNodeAddress(ctx, p)
-			if ok && addr != "" {
-				resolvedAddrs = append(resolvedAddrs, addr)
-			}
 		}
 	}
 
@@ -90,19 +84,12 @@ func (d *Downloader) ResolveProviders(ctx context.Context) error {
 	if needDHTLookup {
 		// Try a direct lookup on the DHT network
 		newProviders := d.svc.FindProviders(ctx, d.fileID)
-		var dhtResolved []string
-		for _, p := range newProviders {
-			if p == d.svc.Self().ID || p == "" {
-				continue
-			}
-			addr, ok := d.svc.QueryNodeAddress(ctx, p)
-			if ok && addr != "" {
-				dhtResolved = append(dhtResolved, addr)
-			}
-		}
-
 		d.mu.Lock()
-		d.providerAddrs = append(d.providerAddrs, dhtResolved...)
+		for _, p := range newProviders {
+			addr := p.Endpoint()
+			d.providerNodes[addr] = p
+			d.providerAddrs = append(d.providerAddrs, addr)
+		}
 		d.mu.Unlock()
 	}
 
@@ -408,19 +395,11 @@ func (d *Downloader) getHealthyProvider(ctx context.Context) (string, error) {
 		d.mu.Unlock()
 		log.Printf("[DOWNLOADER] All providers failing. Querying DHT for new providers...")
 		newProviders := d.svc.FindProviders(ctx, d.fileID)
-		var resolvedAddrs []string
-		for _, p := range newProviders {
-			if p == d.svc.Self().ID || p == "" {
-				continue
-			}
-			addr, ok := d.svc.QueryNodeAddress(ctx, p)
-			if ok && addr != "" {
-				resolvedAddrs = append(resolvedAddrs, addr)
-			}
-		}
 		d.mu.Lock()
 
-		for _, addr := range resolvedAddrs {
+		for _, p := range newProviders {
+			addr := p.Endpoint()
+			d.providerNodes[addr] = p
 			found := false
 			for _, existing := range d.providerAddrs {
 				if existing == addr {
@@ -449,7 +428,13 @@ func (d *Downloader) getHealthyProvider(ctx context.Context) (string, error) {
 
 func (d *Downloader) getConnection(addr string) (*network.Connection, error) {
 	if d.svc != nil {
-		return d.svc.GetConnection(addr)
+		d.mu.Lock()
+		node, pinned := d.providerNodes[addr]
+		d.mu.Unlock()
+		if pinned {
+			return d.svc.Connect(context.Background(), node)
+		}
+		return d.svc.ConnectAddr(context.Background(), addr)
 	}
 
 	d.mu.Lock()

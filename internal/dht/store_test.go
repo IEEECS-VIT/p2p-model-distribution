@@ -20,7 +20,7 @@ func TestProviderStoreConcurrentAccess(t *testing.T) {
 
 		go func(i int) {
 			defer wg.Done()
-			store.Add(fmt.Sprintf("chunk-%d", i%5), fmt.Sprintf("peer-%d", i))
+			store.Add(fmt.Sprintf("chunk-%d", i%5), Node{ID: fmt.Sprintf("peer-%d", i)})
 		}(i)
 
 		go func(i int) {
@@ -44,7 +44,7 @@ func TestProviderStoreCapsProvidersPerKey(t *testing.T) {
 	store := NewStore()
 
 	for i := 0; i < maxProvidersPerKey*3; i++ {
-		store.Add("popular-chunk", fmt.Sprintf("peer-%d", i))
+		store.Add("popular-chunk", Node{ID: fmt.Sprintf("peer-%d", i)})
 	}
 
 	got := len(store.Get("popular-chunk"))
@@ -57,12 +57,8 @@ func TestProviderStoreCapsProvidersPerKey(t *testing.T) {
 // announced once and then went offline: without a TTL, that dead peer would
 // be handed out to downloaders forever.
 func TestProviderStoreExpiresStaleProviders(t *testing.T) {
-	origTTL := providerTTL
-	providerTTL = 20 * time.Millisecond
-	defer func() { providerTTL = origTTL }()
-
-	store := NewStore()
-	store.Add("chunk", "stale-peer")
+	store := newStoreWithTTL(20 * time.Millisecond)
+	store.Add("chunk", Node{ID: "stale-peer"})
 
 	if got := store.Get("chunk"); len(got) != 1 {
 		t.Fatalf("Get(...) = %v, want 1 fresh provider", got)
@@ -72,5 +68,16 @@ func TestProviderStoreExpiresStaleProviders(t *testing.T) {
 
 	if got := store.Get("chunk"); len(got) != 0 {
 		t.Fatalf("Get(...) = %v, want expired provider to be pruned", got)
+	}
+}
+
+func TestProviderStoreKeepsAddresses(t *testing.T) {
+	store := NewStore()
+	store.Add("file", Node{ID: "p1", IP: "10.0.0.1", Port: 9000})
+	store.Add("file", Node{ID: "p1", IP: "10.0.0.2", Port: 9001}) // re-announce from a new address
+
+	got := store.Get("file")
+	if len(got) != 1 || got[0].Endpoint() != "10.0.0.2:9001" {
+		t.Fatalf("Get = %+v, want one record at the latest address", got)
 	}
 }
