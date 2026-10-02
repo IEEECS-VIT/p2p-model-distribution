@@ -338,8 +338,7 @@ func runDHDownloader(ctx context.Context, fileID, outPath, dataDir string, svc *
 	fmt.Printf("%s[DHT]%s Looking up providers for File ID: %s%s%s...\n",
 		colorBlue, colorReset, colorBold, fileID, colorReset)
 
-	dlCtx, dlCancel := context.WithTimeout(ctx, 60*time.Second)
-	defer dlCancel()
+	dlCtx := ctx
 
 	// Query DHT network for providers, retrying up to 15 seconds to allow background bootstrap connection.
 	var providers []dht.Node
@@ -360,11 +359,11 @@ func runDHDownloader(ctx context.Context, fileID, outPath, dataDir string, svc *
 foundProviders:
 	fmt.Printf("%s[DHT]%s Found %d initial provider(s)\n", colorGreen, colorReset, len(providers))
 
-	dl := downloader.New(fileID, dataDir, svc, store, nil, 4, nil)
-	_, err := dl.Download(dlCtx, outPath)
-	if err != nil {
+	dl := downloader.New(fileID, store, svc, downloader.Options{Progress: printProgress})
+	if _, err := dl.Download(dlCtx, outPath); err != nil {
 		log.Fatalf("download failed: %v", err)
 	}
+	fmt.Printf("\n%s[DOWNLOAD]%s ✓ File reassembled and hash verified\n", colorGreen, colorReset)
 }
 
 //---------------------------------------------------------------------
@@ -479,18 +478,26 @@ func runSeeder(id *identity.Identity, port, filePath, dataDir string, chunkSize 
 
 func runDownloader(id *identity.Identity, seederAddr, fileID, dataDir, outPath string) {
 	store := storage.NewStore(dataDir)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
 
-	dl := downloader.New(fileID, dataDir, nil, store, []string{seederAddr}, 4, id.ClientTLSConfig(""))
-	_, err := dl.Download(ctx, outPath)
-	if err != nil {
+	svc := dht.NewService(id, "127.0.0.1:0", "", nil)
+	if err := svc.Start(); err != nil {
+		log.Fatalf("failed to start node: %v", err)
+	}
+	defer svc.Stop()
+
+	dl := downloader.New(fileID, store, svc, downloader.Options{Providers: []string{seederAddr}, Progress: printProgress})
+	if _, err := dl.Download(context.Background(), outPath); err != nil {
 		log.Fatalf("download failed: %v", err)
 	}
+	fmt.Printf("\n%s[DOWNLOAD]%s ✓ File reassembled and hash verified\n", colorGreen, colorReset)
 }
 
 //---------------------------------------------------------------------
 // Helpers
+
+func printProgress(done, total int) {
+	fmt.Printf("\r%s[DOWNLOAD]%s Fetching chunks: %d/%d [%d%%]", colorYellow, colorReset, done, total, done*100/total)
+}
 
 func printHeader() {
 	fmt.Printf("%s%s┌────────────────────────────────────────────────────────┐%s\n", colorBold, colorCyan, colorReset)

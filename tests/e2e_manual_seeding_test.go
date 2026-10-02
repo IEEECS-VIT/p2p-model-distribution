@@ -329,7 +329,7 @@ func TestEndToEnd_DHTDistribution(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// 5. Run Downloader with DHT fallback enabled (passing nil initialProviders)
-	dl := downloader.New(fileID, downloaderDir, downloaderSvc, downloaderStore, nil, 2, nil)
+	dl := downloader.New(fileID, downloaderStore, downloaderSvc, downloader.Options{Concurrency: 2})
 
 	assembledPath := filepath.Join(downloaderDir, "dht-assembled.bin")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

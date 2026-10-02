@@ -1,11 +1,15 @@
+// Package downloader fetches a file from peers: it authenticates the
+// manifest against the file ID, downloads chunks in parallel from every
+// available provider, verifies each chunk, and reassembles the file.
 package downloader
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -21,142 +25,126 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ANSI terminal color codes
 const (
-	colorReset  = "\033[0m"
-	colorBold   = "\033[1m"
-	colorGreen  = "\033[32m"
-	colorCyan   = "\033[36m"
-	colorBlue   = "\033[34m"
-	colorYellow = "\033[33m"
-	colorRed    = "\033[31m"
+	// DefaultConcurrency is the number of chunks fetched in parallel.
+	DefaultConcurrency = 4
+
+	// requestTimeout bounds a single metadata or chunk request (a chunk
+	// is at most filemeta.MaxChunkSize).
+	requestTimeout = 60 * time.Second
+
+	// maxChunkAttempts is how many times a chunk is requested (from any
+	// providers) before the download fails.
+	maxChunkAttempts = 8
+
+	// rediscoverInterval rate-limits DHT lookups for more providers.
+	rediscoverInterval = 10 * time.Second
 )
 
+// Vars rather than consts so tests can shrink them.
+var (
+	// Failing providers are retried after an exponential backoff.
+	baseBackoff = 500 * time.Millisecond
+	maxBackoff  = 30 * time.Second
+
+	// providerWaitTimeout is how long a worker waits for any provider to
+	// become available before giving up.
+	providerWaitTimeout = 2 * time.Minute
+)
+
+// Network is the subset of dht.Service the downloader needs.
+type Network interface {
+	FindProviders(ctx context.Context, key string) []dht.Node
+	Connect(ctx context.Context, node dht.Node) (*network.Connection, error)
+	ConnectAddr(ctx context.Context, addr string) (*network.Connection, error)
+}
+
+// Options configures a Downloader.
+type Options struct {
+	// Providers are addresses ("ip:port") to download from in addition
+	// to providers discovered through the DHT.
+	Providers []string
+	// Concurrency is the number of chunks fetched in parallel
+	// (DefaultConcurrency if <= 0).
+	Concurrency int
+	// Progress, if set, is called after each chunk is stored.
+	Progress func(done, total int)
+}
+
+type provider struct {
+	addr     string
+	node     *dht.Node // set when found via the DHT; its ID is pinned when dialing
+	inflight int
+	failures int
+	retryAt  time.Time
+}
+
+// Downloader downloads a single file by ID.
 type Downloader struct {
-	fileID           string
-	tlsConfig        *tls.Config
-	dataDir          string
-	svc              *dht.Service
-	store            *storage.Store
-	concurrency      int
-	initialProviders []string
+	fileID string
+	store  *storage.Store
+	nw     Network
+	opts   Options
 
-	mu               sync.Mutex
-	providerAddrs    []string
-	providerFailures map[string]int
-	providerNodes    map[string]dht.Node            // addr -> provider found via the DHT (ID is pinned when dialing)
-	connections      map[string]*network.Connection // active connections dialed locally (when svc == nil)
+	mu              sync.Mutex
+	providers       map[string]*provider // by address
+	lastDiscovery   time.Time
+	providerChanged chan struct{} // closed and replaced when providers are added
 }
 
-// New creates a Downloader. tlsConfig is used to dial providers directly
-// when svc is nil.
-func New(fileID string, dataDir string, svc *dht.Service, store *storage.Store, initialProviders []string, concurrency int, tlsConfig *tls.Config) *Downloader {
-	if concurrency <= 0 {
-		concurrency = 4
+// New creates a Downloader for fileID that stores chunks in store and
+// finds and reaches providers through nw.
+func New(fileID string, store *storage.Store, nw Network, opts Options) *Downloader {
+	if opts.Concurrency <= 0 {
+		opts.Concurrency = DefaultConcurrency
 	}
-	return &Downloader{
-		fileID:           fileID,
-		tlsConfig:        tlsConfig,
-		dataDir:          dataDir,
-		svc:              svc,
-		store:            store,
-		concurrency:      concurrency,
-		initialProviders: initialProviders,
-		providerFailures: make(map[string]int),
-		providerNodes:    make(map[string]dht.Node),
-		connections:      make(map[string]*network.Connection),
+	d := &Downloader{
+		fileID:          fileID,
+		store:           store,
+		nw:              nw,
+		opts:            opts,
+		providers:       make(map[string]*provider),
+		providerChanged: make(chan struct{}),
 	}
-}
-
-func (d *Downloader) ResolveProviders(ctx context.Context) error {
-	var resolvedAddrs []string
-	for _, p := range d.initialProviders {
-		if isAddress(p) {
-			resolvedAddrs = append(resolvedAddrs, p)
+	for _, addr := range opts.Providers {
+		if _, _, err := net.SplitHostPort(addr); err == nil {
+			d.providers[addr] = &provider{addr: addr}
 		}
 	}
-
-	d.mu.Lock()
-	d.providerAddrs = resolvedAddrs
-	needDHTLookup := len(d.providerAddrs) == 0 && d.svc != nil
-	d.mu.Unlock()
-
-	if needDHTLookup {
-		// Try a direct lookup on the DHT network
-		newProviders := d.svc.FindProviders(ctx, d.fileID)
-		d.mu.Lock()
-		for _, p := range newProviders {
-			addr := p.Endpoint()
-			d.providerNodes[addr] = p
-			d.providerAddrs = append(d.providerAddrs, addr)
-		}
-		d.mu.Unlock()
-	}
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if len(d.providerAddrs) == 0 {
-		return fmt.Errorf("no dialable provider addresses resolved")
-	}
-
-	return nil
+	return d
 }
 
-// Download fetches the manifest, downloads all chunks in parallel, verifies them, and reassembles the file.
+// Download fetches and verifies the manifest and every chunk, then
+// reassembles the file at outPath (or a file named after the manifest in
+// the OS temp dir if outPath is empty). It returns the manifest.
 func (d *Downloader) Download(ctx context.Context, outPath string) (filemeta.FileMeta, error) {
-	// 1. Resolve providers
-	if err := d.ResolveProviders(ctx); err != nil {
-		return filemeta.FileMeta{}, err
+	if !storage.ValidFileID(d.fileID) {
+		return filemeta.FileMeta{}, fmt.Errorf("invalid file ID %q", d.fileID)
 	}
 
-	// 2. Download manifest
+	d.discover(ctx, true)
+	if d.providerCount() == 0 {
+		return filemeta.FileMeta{}, errors.New("no providers found for this file")
+	}
+
 	meta, err := d.downloadManifest(ctx)
 	if err != nil {
 		return filemeta.FileMeta{}, fmt.Errorf("download manifest: %w", err)
 	}
+	slog.Info("manifest retrieved", "file", meta.FileName, "chunks", meta.NumChunks, "bytes", meta.FileSize)
 
-	fmt.Printf("%s[DOWNLOAD]%s ✓ Manifest retrieved. File: %s%s%s (%d chunks, size: %.2f MB)\n",
-		colorGreen, colorReset, colorBold, meta.FileName, colorReset, meta.NumChunks, float64(meta.FileSize)/(1024*1024))
-
-	// Initialize downloader folders
 	if err := d.store.InitializeFileDirectories(d.fileID); err != nil {
-		return filemeta.FileMeta{}, fmt.Errorf("failed to prepare directories: %w", err)
+		return filemeta.FileMeta{}, fmt.Errorf("prepare directories: %w", err)
 	}
 
-	// 3. Download all chunks in parallel
-	start := time.Now()
-	jobs := make(chan int, meta.NumChunks)
-	for i := 0; i < meta.NumChunks; i++ {
-		jobs <- i
-	}
-	close(jobs)
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, meta.NumChunks)
-	var completedCount int32
-
-	for w := 0; w < d.concurrency; w++ {
-		wg.Add(1)
-		go d.worker(ctx, jobs, errChan, &wg, meta, &completedCount)
+	if err := d.downloadChunks(ctx, meta); err != nil {
+		return filemeta.FileMeta{}, err
 	}
 
-	wg.Wait()
-	close(errChan)
-
-	// Clean up local connections if we dialed any
-	d.cleanupLocalConnections()
-
-	// Check if any workers returned errors
-	if len(errChan) > 0 {
-		return filemeta.FileMeta{}, <-errChan
-	}
-
-	duration := time.Since(start)
-	fmt.Printf("\n%s[DOWNLOAD]%s ✓ All chunks downloaded and verified in %v!\n", colorGreen, colorReset, duration)
-
-	// 4. Save manifest locally
+	// Every chunk is on disk and verified; saving the manifest marks the
+	// file complete in the store.
 	if err := d.store.SaveManifest(meta); err != nil {
-		return filemeta.FileMeta{}, fmt.Errorf("failed to save manifest: %w", err)
+		return filemeta.FileMeta{}, fmt.Errorf("save manifest: %w", err)
 	}
 
 	if outPath == "" {
@@ -169,321 +157,303 @@ func (d *Downloader) Download(ctx context.Context, outPath string) (filemeta.Fil
 		outPath = filepath.Join(os.TempDir(), meta.FileName)
 	}
 
-	// 5. Reassemble
-	fmt.Printf("%s[DOWNLOAD]%s Reassembling chunks into target destination: %s%s%s...\n",
-		colorBlue, colorReset, colorBold, outPath, colorReset)
-
 	// AssembleChunks verifies the whole-file hash before moving the
 	// output into place, so outPath never holds an unverified file.
 	if err := filemeta.AssembleChunks(d.store.Layout().ChunksDir(d.fileID), outPath, meta.Chunks, meta.ModelHash); err != nil {
 		return filemeta.FileMeta{}, fmt.Errorf("reassembly failed: %w", err)
 	}
 
-	fmt.Printf("%s[DOWNLOAD]%s %s★ SUCCESS! File reassembled and hash verified cleanly ★%s\n",
-		colorGreen, colorReset, colorBold, colorReset)
-
 	return meta, nil
 }
 
 func (d *Downloader) downloadManifest(ctx context.Context) (filemeta.FileMeta, error) {
-	d.mu.Lock()
-	addrs := append([]string(nil), d.providerAddrs...)
-	d.mu.Unlock()
-
 	var lastErr error
-	for _, addr := range addrs {
-		conn, err := d.getConnection(addr)
+	for attempt := 0; attempt < maxChunkAttempts; attempt++ {
+		p, err := d.acquire(ctx)
 		if err != nil {
-			lastErr = err
-			d.markProviderFailed(addr, err)
-			continue
+			if lastErr != nil {
+				return filemeta.FileMeta{}, fmt.Errorf("%w (last provider error: %v)", err, lastErr)
+			}
+			return filemeta.FileMeta{}, err
 		}
-
-		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		metaReq := &protocol.GetMetadataRequest{FileId: d.fileID}
-		respEnv, err := conn.SendRequest(reqCtx, protocol.MessageType_MSG_GET_METADATA_REQUEST, metaReq)
-		cancel()
-
-		if err != nil {
-			lastErr = err
-			d.markProviderFailed(addr, err)
-			continue
+		meta, err := d.fetchManifest(ctx, p)
+		d.release(p, err)
+		if err == nil {
+			return meta, nil
 		}
-
-		var metaResp protocol.GetMetadataResponse
-		if err := proto.Unmarshal(respEnv.Payload, &metaResp); err != nil {
-			lastErr = err
-			d.markProviderFailed(addr, err)
-			continue
+		if ctx.Err() != nil {
+			return filemeta.FileMeta{}, ctx.Err()
 		}
-
-		if !metaResp.Success {
-			lastErr = fmt.Errorf("provider returned error: %s", metaResp.Error)
-			d.markProviderFailed(addr, lastErr)
-			continue
-		}
-
-		var meta filemeta.FileMeta
-		if err := json.Unmarshal(metaResp.MetadataJson, &meta); err != nil {
-			lastErr = err
-			d.markProviderFailed(addr, err)
-			continue
-		}
-
-		if err := meta.Validate(); err != nil {
-			lastErr = fmt.Errorf("provider sent invalid manifest: %w", err)
-			d.markProviderFailed(addr, lastErr)
-			continue
-		}
-
-		// The file ID is the manifest CID, so this is what authenticates
-		// the manifest (and every hash inside it) against what the user
-		// asked for. Without it a malicious provider could serve any
-		// content with self-consistent hashes.
-		if err := meta.VerifyID(d.fileID); err != nil {
-			lastErr = fmt.Errorf("provider sent a manifest for different content: %w", err)
-			d.markProviderFailed(addr, lastErr)
-			continue
-		}
-		meta.FileID = d.fileID
-
-		// Reset failure count on success
-		d.mu.Lock()
-		d.providerFailures[addr] = 0
-		d.mu.Unlock()
-
-		return meta, nil
+		lastErr = err
 	}
-
-	return filemeta.FileMeta{}, fmt.Errorf("failed to fetch manifest from any provider, last error: %v", lastErr)
+	return filemeta.FileMeta{}, fmt.Errorf("no provider returned a valid manifest: %w", lastErr)
 }
 
-func (d *Downloader) worker(ctx context.Context, jobs <-chan int, errChan chan<- error, wg *sync.WaitGroup, meta filemeta.FileMeta, completedCount *int32) {
-	defer wg.Done()
+func (d *Downloader) fetchManifest(ctx context.Context, p *provider) (filemeta.FileMeta, error) {
+	conn, err := d.connect(ctx, p)
+	if err != nil {
+		return filemeta.FileMeta{}, err
+	}
 
-	for chunkIdx := range jobs {
-		chunkMeta := meta.Chunks[chunkIdx]
+	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	respEnv, err := conn.SendRequest(reqCtx, protocol.MessageType_MSG_GET_METADATA_REQUEST, &protocol.GetMetadataRequest{FileId: d.fileID})
+	if err != nil {
+		return filemeta.FileMeta{}, err
+	}
 
-		var downloaded bool
-		var lastErr error
+	var resp protocol.GetMetadataResponse
+	if err := proto.Unmarshal(respEnv.Payload, &resp); err != nil {
+		return filemeta.FileMeta{}, err
+	}
+	if !resp.Success {
+		return filemeta.FileMeta{}, fmt.Errorf("provider returned error: %s", resp.Error)
+	}
 
-		d.mu.Lock()
-		numProviders := len(d.providerAddrs)
-		d.mu.Unlock()
+	var meta filemeta.FileMeta
+	if err := json.Unmarshal(resp.MetadataJson, &meta); err != nil {
+		return filemeta.FileMeta{}, err
+	}
+	if err := meta.Validate(); err != nil {
+		return filemeta.FileMeta{}, fmt.Errorf("provider sent invalid manifest: %w", err)
+	}
+	// The file ID is the manifest CID, so this is what authenticates the
+	// manifest (and every hash inside it) against what the user asked
+	// for. Without it a malicious provider could serve any content with
+	// self-consistent hashes.
+	if err := meta.VerifyID(d.fileID); err != nil {
+		return filemeta.FileMeta{}, fmt.Errorf("provider sent a manifest for different content: %w", err)
+	}
+	meta.FileID = d.fileID
+	return meta, nil
+}
 
-		maxRetries := numProviders * 2
-		if maxRetries < 3 {
-			maxRetries = 3
-		}
+func (d *Downloader) downloadChunks(ctx context.Context, meta filemeta.FileMeta) error {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 
-		for attempt := 0; attempt < maxRetries; attempt++ {
-			select {
-			case <-ctx.Done():
-				select {
-				case errChan <- ctx.Err():
-				default:
+	jobs := make(chan int, meta.NumChunks)
+	for i := 0; i < meta.NumChunks; i++ {
+		jobs <- i
+	}
+	close(jobs)
+
+	var done atomic.Int32
+	var wg sync.WaitGroup
+	for w := 0; w < d.opts.Concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				if ctx.Err() != nil {
+					return
 				}
-				return
-			default:
-			}
-
-			addr, err := d.getHealthyProvider(ctx)
-			if err != nil {
-				lastErr = err
-				break
-			}
-
-			conn, err := d.getConnection(addr)
-			if err != nil {
-				d.markProviderFailed(addr, err)
-				lastErr = err
-				continue
-			}
-
-			reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			chunkReq := &protocol.GetChunkRequest{
-				FileId:     d.fileID,
-				ChunkIndex: int32(chunkIdx),
-			}
-			respEnv, err := conn.SendRequest(reqCtx, protocol.MessageType_MSG_GET_CHUNK_REQUEST, chunkReq)
-			cancel()
-
-			if err != nil {
-				d.markProviderFailed(addr, err)
-				lastErr = err
-				continue
-			}
-
-			var chunkResp protocol.GetChunkResponse
-			if err := proto.Unmarshal(respEnv.Payload, &chunkResp); err != nil {
-				d.markProviderFailed(addr, err)
-				lastErr = err
-				continue
-			}
-
-			if !chunkResp.Success {
-				err := fmt.Errorf("provider returned error: %s", chunkResp.Error)
-				d.markProviderFailed(addr, err)
-				lastErr = err
-				continue
-			}
-
-			// Verify chunk integrity
-			if len(chunkResp.Data) != chunkMeta.Size {
-				err := fmt.Errorf("chunk %d has %d bytes, want %d", chunkIdx, len(chunkResp.Data), chunkMeta.Size)
-				d.markProviderFailed(addr, err)
-				lastErr = err
-				continue
-			}
-			if err := filemeta.VerifyChunk(chunkResp.Data, chunkMeta.Hash); err != nil {
-				err := fmt.Errorf("chunk hash mismatch: %w", err)
-				d.markProviderFailed(addr, err)
-				lastErr = err
-				continue
-			}
-
-			// Save chunk to disk
-			if err := d.store.WriteChunk(d.fileID, chunkIdx, chunkResp.Data); err != nil {
-				lastErr = fmt.Errorf("failed to write chunk: %w", err)
-				// Disk error is fatal for this download job, not provider specific
-				break
-			}
-
-			// Success! Reset failures.
-			d.mu.Lock()
-			d.providerFailures[addr] = 0
-			d.mu.Unlock()
-
-			downloaded = true
-			newCompleted := atomic.AddInt32(completedCount, 1)
-			fmt.Printf("\r%s[DOWNLOAD]%s Fetching chunks: %d/%d [%d%%]",
-				colorYellow, colorReset, newCompleted, meta.NumChunks, (newCompleted * 100 / int32(meta.NumChunks)))
-			break
-		}
-
-		if !downloaded {
-			select {
-			case errChan <- fmt.Errorf("failed to download chunk %d after retries: %v", chunkIdx, lastErr):
-			default:
-			}
-			return
-		}
-	}
-}
-
-func (d *Downloader) getHealthyProvider(ctx context.Context) (string, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	var bestAddr string
-	minFailures := 999999
-
-	for _, addr := range d.providerAddrs {
-		failCount := d.providerFailures[addr]
-		if failCount < 3 && failCount < minFailures {
-			minFailures = failCount
-			bestAddr = addr
-		}
-	}
-
-	if bestAddr != "" {
-		return bestAddr, nil
-	}
-
-	// If all providers have >= 3 failures, try to discover more via DHT
-	if d.svc != nil {
-		d.mu.Unlock()
-		log.Printf("[DOWNLOADER] All providers failing. Querying DHT for new providers...")
-		newProviders := d.svc.FindProviders(ctx, d.fileID)
-		d.mu.Lock()
-
-		for _, p := range newProviders {
-			addr := p.Endpoint()
-			d.providerNodes[addr] = p
-			found := false
-			for _, existing := range d.providerAddrs {
-				if existing == addr {
-					found = true
-					break
+				if err := d.downloadChunk(ctx, meta.Chunks[idx]); err != nil {
+					// The first failure cancels every other worker.
+					cancel(err)
+					return
+				}
+				n := int(done.Add(1))
+				if d.opts.Progress != nil {
+					d.opts.Progress(n, meta.NumChunks)
 				}
 			}
-			if !found {
-				d.providerAddrs = append(d.providerAddrs, addr)
-				d.providerFailures[addr] = 0
-				log.Printf("[DOWNLOADER] Discovered new provider address from DHT: %s", addr)
-			}
-		}
+		}()
 	}
+	wg.Wait()
 
-	// If we still have no providers or all are failing, reset failure counters of existing ones and try again
-	if len(d.providerAddrs) > 0 {
-		for _, addr := range d.providerAddrs {
-			d.providerFailures[addr] = 0
-		}
-		return d.providerAddrs[0], nil
-	}
-
-	return "", fmt.Errorf("no providers available")
+	return context.Cause(ctx)
 }
 
-func (d *Downloader) getConnection(addr string) (*network.Connection, error) {
-	if d.svc != nil {
-		d.mu.Lock()
-		node, pinned := d.providerNodes[addr]
-		d.mu.Unlock()
-		if pinned {
-			return d.svc.Connect(context.Background(), node)
+func (d *Downloader) downloadChunk(ctx context.Context, chunk filemeta.ChunkMeta) error {
+	var lastErr error
+	for attempt := 0; attempt < maxChunkAttempts; attempt++ {
+		p, err := d.acquire(ctx)
+		if err != nil {
+			if lastErr != nil {
+				return fmt.Errorf("chunk %d: %w (last provider error: %v)", chunk.Index, err, lastErr)
+			}
+			return fmt.Errorf("chunk %d: %w", chunk.Index, err)
 		}
-		return d.svc.ConnectAddr(context.Background(), addr)
+
+		data, err := d.fetchChunk(ctx, p, chunk)
+		d.release(p, err)
+		if err != nil {
+			if ctx.Err() != nil {
+				return context.Cause(ctx)
+			}
+			slog.Debug("chunk request failed", "chunk", chunk.Index, "provider", p.addr, "err", err)
+			lastErr = err
+			continue
+		}
+
+		if err := d.store.WriteChunk(d.fileID, chunk.Index, data); err != nil {
+			// A local disk error is not the provider's fault and won't be
+			// fixed by retrying elsewhere.
+			return fmt.Errorf("write chunk %d: %w", chunk.Index, err)
+		}
+		return nil
 	}
+	return fmt.Errorf("chunk %d failed after %d attempts: %w", chunk.Index, maxChunkAttempts, lastErr)
+}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if conn, exists := d.connections[addr]; exists {
-		return conn, nil
-	}
-
-	// Any peer may serve the file: the manifest is authenticated by its
-	// CID, so the provider's identity does not need to be pinned here.
-	conn, err := network.Dial(context.Background(), addr, d.tlsConfig)
+func (d *Downloader) fetchChunk(ctx context.Context, p *provider, chunk filemeta.ChunkMeta) ([]byte, error) {
+	conn, err := d.connect(ctx, p)
 	if err != nil {
 		return nil, err
 	}
-	conn.Start()
-	d.connections[addr] = conn
-	return conn, nil
+
+	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	req := &protocol.GetChunkRequest{FileId: d.fileID, ChunkIndex: int32(chunk.Index)}
+	respEnv, err := conn.SendRequest(reqCtx, protocol.MessageType_MSG_GET_CHUNK_REQUEST, req)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp protocol.GetChunkResponse
+	if err := proto.Unmarshal(respEnv.Payload, &resp); err != nil {
+		return nil, err
+	}
+	if !resp.Success {
+		return nil, fmt.Errorf("provider returned error: %s", resp.Error)
+	}
+	if len(resp.Data) != chunk.Size {
+		return nil, fmt.Errorf("chunk %d has %d bytes, want %d", chunk.Index, len(resp.Data), chunk.Size)
+	}
+	if err := filemeta.VerifyChunk(resp.Data, chunk.Hash); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
 }
 
-func (d *Downloader) markProviderFailed(addr string, err error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+func (d *Downloader) connect(ctx context.Context, p *provider) (*network.Connection, error) {
+	if p.node != nil {
+		return d.nw.Connect(ctx, *p.node)
+	}
+	return d.nw.ConnectAddr(ctx, p.addr)
+}
 
-	d.providerFailures[addr]++
-	log.Printf("[DOWNLOADER] Error from provider %s: %v (fail count: %d)", addr, err, d.providerFailures[addr])
-
-	// Close and remove the cached connection if we dialed it locally (legacy mode)
-	if d.svc == nil {
-		if conn, exists := d.connections[addr]; exists {
-			_ = conn.Close()
-			delete(d.connections, addr)
+// acquire picks the available provider with the fewest requests in
+// flight (ties broken by fewest recent failures, then randomly), so load
+// spreads across every provider. If none is available it triggers DHT
+// rediscovery and waits for a provider to appear or come out of backoff.
+func (d *Downloader) acquire(ctx context.Context) (*provider, error) {
+	deadline := time.Now().Add(providerWaitTimeout)
+	for {
+		d.mu.Lock()
+		now := time.Now()
+		var best *provider
+		var nextRetry time.Time
+		ties := 0
+		for _, p := range d.providers {
+			if now.Before(p.retryAt) {
+				if nextRetry.IsZero() || p.retryAt.Before(nextRetry) {
+					nextRetry = p.retryAt
+				}
+				continue
+			}
+			switch {
+			case best == nil || p.inflight < best.inflight ||
+				(p.inflight == best.inflight && p.failures < best.failures):
+				best, ties = p, 1
+			case p.inflight == best.inflight && p.failures == best.failures:
+				// Reservoir sampling for a uniform random tie-break.
+				ties++
+				if rand.IntN(ties) == 0 {
+					best = p
+				}
+			}
 		}
+		if best != nil {
+			best.inflight++
+			d.mu.Unlock()
+			return best, nil
+		}
+		changed := d.providerChanged
+		d.mu.Unlock()
+
+		if time.Now().After(deadline) {
+			return nil, errors.New("no provider available")
+		}
+
+		go d.discover(context.WithoutCancel(ctx), false)
+
+		wait := time.Until(deadline)
+		if !nextRetry.IsZero() && time.Until(nextRetry) < wait {
+			wait = time.Until(nextRetry)
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, context.Cause(ctx)
+		case <-changed:
+		case <-timer.C:
+		}
+		timer.Stop()
 	}
 }
 
-func (d *Downloader) cleanupLocalConnections() {
+// release returns a provider acquired with acquire, recording whether the
+// request succeeded.
+func (d *Downloader) release(p *provider, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	p.inflight--
+	if err == nil {
+		p.failures = 0
+		p.retryAt = time.Time{}
+		return
+	}
+	p.failures++
+	backoff := min(baseBackoff<<min(p.failures-1, 16), maxBackoff)
+	p.retryAt = time.Now().Add(backoff)
+	slog.Debug("provider failed", "provider", p.addr, "failures", p.failures, "retry_in", backoff, "err", err)
+}
 
-	if d.svc == nil {
-		for addr, conn := range d.connections {
-			_ = conn.Close()
-			delete(d.connections, addr)
+// discover looks up providers in the DHT and adds any new ones. Unless
+// force is set it is rate-limited to once per rediscoverInterval.
+func (d *Downloader) discover(ctx context.Context, force bool) {
+	d.mu.Lock()
+	if !force && time.Since(d.lastDiscovery) < rediscoverInterval {
+		d.mu.Unlock()
+		return
+	}
+	d.lastDiscovery = time.Now()
+	d.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	found := d.nw.FindProviders(ctx, d.fileID)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	added := 0
+	for _, n := range found {
+		addr := n.Endpoint()
+		if addr == "" {
+			continue
 		}
+		node := n
+		if p, ok := d.providers[addr]; ok {
+			if p.node == nil {
+				p.node = &node
+			}
+			continue
+		}
+		d.providers[addr] = &provider{addr: addr, node: &node}
+		added++
+	}
+	if added > 0 {
+		slog.Debug("discovered providers", "new", added, "total", len(d.providers))
+		close(d.providerChanged)
+		d.providerChanged = make(chan struct{})
 	}
 }
 
-func isAddress(s string) bool {
-	_, _, err := net.SplitHostPort(s)
-	return err == nil
+func (d *Downloader) providerCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.providers)
 }
