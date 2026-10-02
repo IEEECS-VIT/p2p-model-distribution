@@ -1,0 +1,11 @@
+# Only the Go sources are needed to build the image.
+.git
+.github
+.githooks
+bin/
+node-data/
+docs/
+tests/
+*.md
+Dockerfile
+.dockerignore
