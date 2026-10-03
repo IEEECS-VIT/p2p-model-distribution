@@ -1,0 +1,65 @@
+# GoReleaser configuration: builds release binaries for every supported
+# platform, packages them with checksums, and publishes the GitHub Release.
+# Run by .github/workflows/release.yml when a v* tag is pushed.
+# Local dry run: goreleaser release --snapshot --clean
+version: 2
+
+project_name: p2p-model-distribution
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  - id: node
+    main: ./cmd/node
+    binary: node
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.date={{ .CommitDate }}
+    # Use the commit time for file timestamps so builds are reproducible.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: node
+    ids: [node]
+    name_template: "node_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot+{{ .ShortCommit }}"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^Merge pull request"
+
+release:
+  github:
+    owner: IEEECS-VIT
+    name: p2p-model-distribution
+  # Tags like v1.0.0-rc.1 are published as pre-releases.
+  prerelease: auto
