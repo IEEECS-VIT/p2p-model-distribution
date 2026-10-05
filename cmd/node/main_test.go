@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -33,5 +34,19 @@ func TestParseFlags(t *testing.T) {
 		if _, err := parseFlags(args); err == nil {
 			t.Errorf("parseFlags(%q) succeeded, want error", args)
 		}
+	}
+}
+
+func TestVersionFlag(t *testing.T) {
+	o, err := parseFlags([]string{"-version", "-chunk-kb", "0"})
+	if err != nil || !o.showVersion {
+		t.Fatalf("parseFlags(-version) = %+v, %v; want showVersion without validation errors", o, err)
+	}
+
+	orig := version
+	version = "v9.9.9"
+	defer func() { version = orig }()
+	if got := versionString(); !strings.HasPrefix(got, "node v9.9.9 (commit ") {
+		t.Fatalf("versionString() = %q", got)
 	}
 }

@@ -55,8 +55,8 @@ func Generate() (*Identity, error) {
 }
 
 // LoadOrCreate loads the identity key stored at path, creating it (with
-// mode 0600) if it does not exist. Like OpenSSH, it refuses to use a key
-// file that is readable by group or others.
+// mode 0600) if it does not exist. Like OpenSSH, it refuses (on Unix-like
+// systems) to use a key file that is readable by group or others.
 func LoadOrCreate(path string) (*Identity, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -70,8 +70,8 @@ func LoadOrCreate(path string) (*Identity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stat identity key: %w", err)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("identity key %s has permissions %#o; it must not be accessible by group or others (chmod 600)", path, info.Mode().Perm())
+	if err := checkKeyPermissions(path, info); err != nil {
+		return nil, err
 	}
 
 	block, _ := pem.Decode(data)

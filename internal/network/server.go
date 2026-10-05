@@ -23,7 +23,7 @@ const DefaultMaxConnections = 512
 
 // HandshakeTimeout bounds the TLS handshake on both inbound and outbound
 // connections, so a peer that connects and stalls cannot hold a slot.
-// Var rather than const so tests can shrink it.
+// Each Server captures it when created (see SetHandshakeTimeout).
 var HandshakeTimeout = 10 * time.Second
 
 // Server accepts mutually authenticated TLS connections from other peers.
@@ -41,6 +41,11 @@ type Server struct {
 	quit chan struct{}
 	// wg ensures we wait for all internal goroutines to finish before exiting.
 	wg sync.WaitGroup
+
+	// handshakeTimeout bounds each inbound TLS handshake, and
+	// readIdleTimeout is applied to every accepted connection.
+	handshakeTimeout time.Duration
+	readIdleTimeout  time.Duration
 
 	// maxConns is the concurrent inbound connection cap.
 	maxConns atomic.Int32
@@ -60,10 +65,12 @@ type Server struct {
 // client certificates (see identity.Identity.ServerTLSConfig).
 func NewServer(listenAddr string, tlsConfig *tls.Config) *Server {
 	s := &Server{
-		listenAddr: listenAddr,
-		tlsConfig:  tlsConfig,
-		quit:       make(chan struct{}),
-		conns:      make(map[net.Conn]struct{}),
+		listenAddr:       listenAddr,
+		tlsConfig:        tlsConfig,
+		handshakeTimeout: HandshakeTimeout,
+		readIdleTimeout:  ReadIdleTimeout,
+		quit:             make(chan struct{}),
+		conns:            make(map[net.Conn]struct{}),
 	}
 	s.maxConns.Store(DefaultMaxConnections)
 	return s
@@ -73,6 +80,18 @@ func NewServer(listenAddr string, tlsConfig *tls.Config) *Server {
 // called before Start.
 func (s *Server) SetMaxConnections(n int) {
 	s.maxConns.Store(int32(n))
+}
+
+// SetHandshakeTimeout overrides the inbound TLS handshake timeout. Must be
+// called before Start.
+func (s *Server) SetHandshakeTimeout(d time.Duration) {
+	s.handshakeTimeout = d
+}
+
+// SetReadIdleTimeout overrides the per-frame read timeout applied to
+// accepted connections. Must be called before Start.
+func (s *Server) SetReadIdleTimeout(d time.Duration) {
+	s.readIdleTimeout = d
 }
 
 // Start opens the TCP port and begins accepting connections.
@@ -149,7 +168,7 @@ func (s *Server) release(conn net.Conn) {
 }
 
 func (s *Server) handle(raw net.Conn) {
-	ctx, cancel := context.WithTimeout(context.Background(), HandshakeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.handshakeTimeout)
 	defer cancel()
 
 	tlsConn := tls.Server(raw, s.tlsConfig)
@@ -167,6 +186,7 @@ func (s *Server) handle(raw net.Conn) {
 	}
 
 	conn := NewConnection(tlsConn, peerID)
+	conn.readIdleTimeout = s.readIdleTimeout
 	conn.SetOnClose(func() { s.release(raw) })
 	s.OnNewConnection(conn)
 }

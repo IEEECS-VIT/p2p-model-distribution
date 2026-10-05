@@ -73,7 +73,7 @@ See [`docs/`](docs) for details:
 | Transport      | TCP + mutual TLS 1.3 (self-signed ed25519 certs)    |
 | Discovery      | Kademlia-style DHT (K=20, α=3)                      |
 | Integrity      | SHA-256 per chunk, per file, and per manifest (CID) |
-| CI             | GitHub Actions: `go vet`, build, `go test -race`    |
+| CI / Releases  | GitHub Actions, GoReleaser, Docker (distroless, GHCR) |
 
 ---
 
@@ -112,6 +112,17 @@ Requires Go (see `go.mod` for the version).
 
 ```bash
 make build          # produces ./bin/node
+./bin/node -version
+```
+
+Or skip building and download a prebuilt binary for Linux, macOS or
+Windows (amd64/arm64) from the
+[Releases page](https://github.com/IEEECS-VIT/p2p-model-distribution/releases),
+then verify it:
+
+```bash
+sha256sum --ignore-missing -c checksums.txt
+gh attestation verify node_<version>_linux_amd64.tar.gz --repo IEEECS-VIT/p2p-model-distribution
 ```
 
 ### 3. Run a Small Network
@@ -150,6 +161,67 @@ node seeds every complete file in its data directory when it starts.
 | `-log-level` | `info` | `debug`, `info`, `warn` or `error` |
 
 Colour output is disabled when stdout is not a terminal or `NO_COLOR` is set.
+
+---
+
+## Docker Setup
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to GitHub
+Container Registry for every release. The image is distroless, runs as a
+non-root user, and keeps all state in the `/data` volume. Its entrypoint
+already passes `-data /data -listen 0.0.0.0:9000`, so any arguments you
+give are appended.
+
+### Build Image
+
+```bash
+docker build -t p2p-model-distribution .
+```
+
+### Run Container
+
+```bash
+# Bootstrap/seed node. Keep the volume: it holds node.key, the node's identity.
+docker run -d --name p2p-node --restart unless-stopped \
+  -p 9000:9000 -v p2p-data:/data \
+  ghcr.io/ieeecs-vit/p2p-model-distribution:latest
+
+# Seed a model mounted from the host
+docker run -d --name p2p-seeder -p 9000:9000 -v p2p-data:/data \
+  -v "$PWD/model.safetensors:/model.safetensors:ro" \
+  ghcr.io/ieeecs-vit/p2p-model-distribution:latest \
+  -seed /model.safetensors -bootstrap <boot-ip>:9000 -external <public-ip>:9000
+```
+
+On a public server, pass `-external <public-ip>:9000` so peers are given
+the right address. If you use a bind mount instead of a named volume, the
+host directory must be writable by UID `65532`.
+
+---
+
+## Releases
+
+Pushing a version tag runs [`release.yml`](.github/workflows/release.yml).
+It runs the tests, publishes binaries and `checksums.txt` to a GitHub
+Release via [GoReleaser](.goreleaser.yaml), pushes the multi-arch image to
+GHCR, and signs build-provenance attestations for both.
+
+```bash
+git checkout main && git pull
+git tag -a v1.0.0 -m "v1.0.0"     # v1.0.0-rc.1 publishes a pre-release
+git push origin v1.0.0
+```
+
+Follow [semantic versioning](https://semver.org): bump the major version
+for wire-protocol or storage-format changes. After the first release, set
+the GHCR package's visibility to public in the organization's package
+settings so the image can be pulled without logging in.
+
+To try the release build locally without publishing anything:
+
+```bash
+goreleaser release --snapshot --clean   # outputs to ./dist
+```
 
 ---
 

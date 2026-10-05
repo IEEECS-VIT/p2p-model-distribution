@@ -38,6 +38,7 @@ type options struct {
 	exitAfterDownload bool
 	timeout           time.Duration
 	logLevel          slog.Level
+	showVersion       bool
 }
 
 func main() {
@@ -48,6 +49,10 @@ func main() {
 		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(2)
+	}
+	if opts.showVersion {
+		fmt.Println(versionString())
+		return
 	}
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: opts.logLevel})))
@@ -78,8 +83,12 @@ func parseFlags(args []string) (options, error) {
 	fs.BoolVar(&o.exitAfterDownload, "exit-after-download", false, "exit after downloading instead of seeding the file")
 	fs.DurationVar(&o.timeout, "timeout", 0, "give up on the download after this long (0 = no limit)")
 	fs.StringVar(&logLevel, "log-level", "info", "log level: debug, info, warn or error")
+	fs.BoolVar(&o.showVersion, "version", false, "print version information and exit")
 	if err := fs.Parse(args); err != nil {
 		return o, err
+	}
+	if o.showVersion {
+		return o, nil
 	}
 	if fs.NArg() > 0 {
 		return o, fmt.Errorf("unexpected arguments: %v", fs.Args())
