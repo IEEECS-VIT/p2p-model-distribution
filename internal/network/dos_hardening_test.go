@@ -12,11 +12,8 @@ import (
 // the read loop blocked forever on ReadFrame, leaking a goroutine and file
 // descriptor for the life of the process.
 func TestConnection_IdleReadTimeoutDropsConnection(t *testing.T) {
-	origTimeout := ReadIdleTimeout
-	ReadIdleTimeout = 100 * time.Millisecond
-	defer func() { ReadIdleTimeout = origTimeout }()
-
 	server, _ := newTestServer(t)
+	server.SetReadIdleTimeout(100 * time.Millisecond)
 
 	closed := make(chan struct{})
 	server.OnNewConnection = func(conn *Connection) {
@@ -131,11 +128,8 @@ func TestServer_StopClosesConnectionsAndIsIdempotent(t *testing.T) {
 // TestServer_StalledHandshakeIsDropped reproduces a peer that opens a TCP
 // connection and never starts the TLS handshake.
 func TestServer_StalledHandshakeIsDropped(t *testing.T) {
-	orig := HandshakeTimeout
-	HandshakeTimeout = 100 * time.Millisecond
-	defer func() { HandshakeTimeout = orig }()
-
 	server, _ := newTestServer(t)
+	server.SetHandshakeTimeout(100 * time.Millisecond)
 	server.OnNewConnection = func(conn *Connection) { conn.Start() }
 	if err := server.Start(); err != nil {
 		t.Fatalf("failed to start server: %v", err)

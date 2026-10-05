@@ -17,8 +17,8 @@ var (
 	// payload) to fully arrive, reset before every ReadFrame call. Without
 	// it, a peer that opens a connection and trickles bytes indefinitely
 	// (or never sends anything) ties up a goroutine and file descriptor
-	// forever. Var rather than const so tests can shrink it; each
-	// Connection captures the value when it is created.
+	// forever. Each Connection captures the value when it is created;
+	// Server.SetReadIdleTimeout overrides it for accepted connections.
 	ReadIdleTimeout = 2 * time.Minute
 
 	// WriteTimeout bounds a single write. Without it, a peer that never
