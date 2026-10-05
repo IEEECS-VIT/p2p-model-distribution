@@ -3,7 +3,7 @@
 # Build stage: always runs on the build machine's architecture and
 # cross-compiles for the target platform, so multi-arch builds don't need
 # emulation.
-FROM --platform=$BUILDPLATFORM golang:1.24-bookworm@sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
