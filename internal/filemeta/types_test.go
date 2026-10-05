@@ -87,6 +87,16 @@ func TestValidateFileName(t *testing.T) {
 		"bell\x07",
 		"bad\xffutf8",
 		strings.Repeat("a", 256),
+		"CON",
+		"nul.txt",
+		"Aux.tar.gz",
+		"com1",
+		"LPT9.bin",
+		"COM¹",
+		"model?.bin",
+		`a"b`,
+		"trailing.",
+		"trailing ",
 	}
 	for _, name := range bad {
 		if err := ValidateFileName(name); err == nil {
@@ -94,7 +104,7 @@ func TestValidateFileName(t *testing.T) {
 		}
 	}
 
-	good := []string{"model.bin", "llama-3 8B.gguf", ".hidden", "模型.safetensors"}
+	good := []string{"model.bin", "llama-3 8B.gguf", ".hidden", "模型.safetensors", "console.bin", "com10.bin", "nullable.txt"}
 	for _, name := range good {
 		if err := ValidateFileName(name); err != nil {
 			t.Errorf("ValidateFileName(%q) = %v, want nil", name, err)
