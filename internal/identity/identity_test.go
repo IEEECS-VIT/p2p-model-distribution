@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -139,7 +140,9 @@ func TestLoadOrCreatePersistsIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
+	// Windows has no Unix permission bits (Go reports 0666); its ACLs
+	// protect the key instead.
+	if perm := info.Mode().Perm(); runtime.GOOS != "windows" && perm != 0o600 {
 		t.Errorf("key file mode = %#o, want 0600", perm)
 	}
 
@@ -156,6 +159,9 @@ func TestLoadOrCreatePersistsIdentity(t *testing.T) {
 }
 
 func TestLoadOrCreateRejectsInsecurePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits do not apply on Windows")
+	}
 	path := filepath.Join(t.TempDir(), "node.key")
 	if _, err := LoadOrCreate(path); err != nil {
 		t.Fatal(err)
