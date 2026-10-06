@@ -21,7 +21,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
-      -o /out/node ./cmd/node \
+      -o /out/p2pmd ./cmd/p2pmd \
  && mkdir -p /out/data
 
 # Runtime stage: distroless static image (no shell, no package manager),
@@ -33,7 +33,7 @@ LABEL org.opencontainers.image.title="p2p-model-distribution" \
       org.opencontainers.image.source="https://github.com/IEEECS-VIT/p2p-model-distribution" \
       org.opencontainers.image.licenses="MIT"
 
-COPY --from=build /out/node /usr/local/bin/node
+COPY --from=build /out/p2pmd /usr/local/bin/p2pmd
 # /data holds node.key (the node's identity), chunks and manifests. It is
 # owned by the runtime user so the key can be created with mode 0600.
 COPY --from=build --chown=65532:65532 /out/data /data
@@ -44,4 +44,4 @@ EXPOSE 9000/tcp
 
 # Defaults live in the entrypoint so extra arguments are appended rather
 # than replacing them (a later -data/-listen overrides these).
-ENTRYPOINT ["/usr/local/bin/node", "-data", "/data", "-listen", "0.0.0.0:9000"]
+ENTRYPOINT ["/usr/local/bin/p2pmd", "-data", "/data", "-listen", "0.0.0.0:9000"]

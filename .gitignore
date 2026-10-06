@@ -6,6 +6,6 @@ bin/
 downloader-data/
 seeder-data/
 assests/
-node-data/
-/node
+p2pmd-data/
+/p2pmd
 dist/

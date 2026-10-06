@@ -46,7 +46,7 @@ func TestVersionFlag(t *testing.T) {
 	orig := version
 	version = "v9.9.9"
 	defer func() { version = orig }()
-	if got := versionString(); !strings.HasPrefix(got, "node v9.9.9 (commit ") {
+	if got := versionString(); !strings.HasPrefix(got, "p2pmd v9.9.9 (commit ") {
 		t.Fatalf("versionString() = %q", got)
 	}
 }

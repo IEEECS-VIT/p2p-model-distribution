@@ -11,9 +11,9 @@ before:
     - go mod verify
 
 builds:
-  - id: node
-    main: ./cmd/node
-    binary: node
+  - id: p2pmd
+    main: ./cmd/p2pmd
+    binary: p2pmd
     env:
       - CGO_ENABLED=0
     goos: [linux, darwin, windows]
@@ -29,9 +29,9 @@ builds:
     mod_timestamp: "{{ .CommitTimestamp }}"
 
 archives:
-  - id: node
-    ids: [node]
-    name_template: "node_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: p2pmd
+    ids: [p2pmd]
+    name_template: "p2pmd_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     formats: [tar.gz]
     format_overrides:
       - goos: windows

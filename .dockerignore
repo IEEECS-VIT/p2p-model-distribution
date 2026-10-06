@@ -3,7 +3,7 @@
 .github
 .githooks
 bin/
-node-data/
+p2pmd-data/
 docs/
 tests/
 *.md
