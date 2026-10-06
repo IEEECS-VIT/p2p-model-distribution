@@ -1,5 +1,7 @@
 # Keeps pinned dependencies current: Go modules, GitHub Actions (pinned by
 # commit SHA) and the Dockerfile's base images (pinned by digest).
+#
+# PR titles use the repo's commit format ("chore: bump ...").
 version: 2
 updates:
   - package-ecosystem: gomod
@@ -7,12 +9,16 @@ updates:
     schedule:
       interval: weekly
     target-branch: dev
+    commit-message:
+      prefix: chore
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     target-branch: dev
+    commit-message:
+      prefix: chore
     groups:
       actions:
         patterns: ["*"]
@@ -22,3 +28,12 @@ updates:
     schedule:
       interval: weekly
     target-branch: dev
+    commit-message:
+      prefix: chore
+    ignore:
+      # The Go version must match go.mod's toolchain line (used by CI and
+      # release binaries), so minor/major Go upgrades are done by hand in
+      # one change. Dependabot still refreshes the image digest, which
+      # picks up Go patch releases and Debian security updates.
+      - dependency-name: golang
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
