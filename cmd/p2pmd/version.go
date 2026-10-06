@@ -47,5 +47,5 @@ func versionString() string {
 	if d == "" {
 		d = "unknown"
 	}
-	return fmt.Sprintf("node %s (commit %s, built %s, %s %s/%s)", version, c, d, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	return fmt.Sprintf("p2pmd %s (commit %s, built %s, %s %s/%s)", version, c, d, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 }

@@ -1,11 +1,11 @@
-// Command node runs a peer of the P2P model distribution network.
+// Command p2pmd runs a peer of the P2P model distribution network.
 //
 // Every node joins the DHT, serves the complete files in its data
 // directory, and announces them so other peers can find them.
 //
-//	node -seed model.bin                      import a file and seed it
-//	node -bootstrap 1.2.3.4:9000              serve stored files
-//	node -bootstrap 1.2.3.4:9000 -download ID download a file, then keep seeding it
+//	p2pmd -seed model.bin                      import a file and seed it
+//	p2pmd -bootstrap 1.2.3.4:9000              serve stored files
+//	p2pmd -bootstrap 1.2.3.4:9000 -download ID download a file, then keep seeding it
 package main
 
 import (
@@ -70,8 +70,8 @@ func parseFlags(args []string) (options, error) {
 	var o options
 	var bootstrap, peers, logLevel string
 
-	fs := flag.NewFlagSet("node", flag.ContinueOnError)
-	fs.StringVar(&o.dataDir, "data", "./node-data", "directory for the node key, chunks and manifests")
+	fs := flag.NewFlagSet("p2pmd", flag.ContinueOnError)
+	fs.StringVar(&o.dataDir, "data", "./p2pmd-data", "directory for the node key, chunks and manifests")
 	fs.StringVar(&o.listen, "listen", ":9000", "address to accept peer connections on")
 	fs.StringVar(&o.external, "external", "", "address advertised to peers (ip:port), if different from the listen address")
 	fs.StringVar(&bootstrap, "bootstrap", "", "comma-separated bootstrap peer addresses (ip:port)")

@@ -116,7 +116,7 @@ each of them `ADD_PROVIDER`.
   network, as soon as a file is added, and again every
   `RepublishInterval` (10 min, well inside the 30 min TTL).
 
-The CLI (`cmd/node`) is a thin wrapper around `node.Node`. See the README
+The CLI (`cmd/p2pmd`) is a thin wrapper around `node.Node`. See the README
 for its flags.
 
 ## 9. End-to-end flow

@@ -6,7 +6,7 @@ setup:
 	@echo "Git hooks configured!"
 
 build:
-	go build -o bin/node ./cmd/node
+	go build -o bin/p2pmd ./cmd/p2pmd
 
 test:
 	go vet ./...
