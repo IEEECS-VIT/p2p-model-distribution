@@ -29,7 +29,7 @@ tracker.
 ## Architecture Overview
 
 ```
- ┌──────────────────────────── cmd/node (CLI) ──────────────────────────────┐
+ ┌──────────────────────────── cmd/p2pmd (CLI) ─────────────────────────────┐
  │                               internal/node                              │
  │      ┌────────────┐   ┌───────────────┐   ┌────────────┐   ┌──────────┐  │
  │      │ downloader │   │ transfer      │   │ dht        │   │ storage  │  │
@@ -80,7 +80,7 @@ See [`docs/`](docs) for details:
 ## Project Structure
 
 ```bash
-cmd/node/            # CLI entry point
+cmd/p2pmd/           # CLI entry point (the p2pmd binary)
 internal/identity/   # node key, node ID derivation, mutual TLS configs
 internal/network/    # TLS server/dialer, framing, request/response multiplexing, router
 internal/protocol/   # generated protobuf code (from proto/p2p.proto)
@@ -111,8 +111,8 @@ cd p2p-model-distribution
 Requires Go (see `go.mod` for the version).
 
 ```bash
-make build          # produces ./bin/node
-./bin/node -version
+make build          # produces ./bin/p2pmd
+./bin/p2pmd -version
 ```
 
 Or skip building and download a prebuilt binary for Linux, macOS or
@@ -122,20 +122,20 @@ then verify it:
 
 ```bash
 sha256sum --ignore-missing -c checksums.txt
-gh attestation verify node_<version>_linux_amd64.tar.gz --repo IEEECS-VIT/p2p-model-distribution
+gh attestation verify p2pmd_<version>_linux_amd64.tar.gz --repo IEEECS-VIT/p2p-model-distribution
 ```
 
 ### 3. Run a Small Network
 
 ```bash
 # 1. A bootstrap node (any node can act as one)
-./bin/node -data ./boot -listen 0.0.0.0:9000
+./bin/p2pmd -data ./boot -listen 0.0.0.0:9000
 
 # 2. Seed a model; note the printed File ID
-./bin/node -data ./seeder -listen 0.0.0.0:9001 -bootstrap <boot-ip>:9000 -seed ./model.safetensors
+./bin/p2pmd -data ./seeder -listen 0.0.0.0:9001 -bootstrap <boot-ip>:9000 -seed ./model.safetensors
 
 # 3. Download it from another machine; the node keeps seeding afterwards
-./bin/node -data ./peer -listen 0.0.0.0:9002 -bootstrap <boot-ip>:9000 \
+./bin/p2pmd -data ./peer -listen 0.0.0.0:9002 -bootstrap <boot-ip>:9000 \
   -download <file-id> -out ./model.safetensors
 ```
 
@@ -147,7 +147,7 @@ node seeds every complete file in its data directory when it starts.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-data` | `./node-data` | Node key, chunks and manifests |
+| `-data` | `./p2pmd-data` | Node key, chunks and manifests |
 | `-listen` | `:9000` | Address to accept peers on |
 | `-external` | | Address to advertise if it differs from the listen address (e.g. a port forward) |
 | `-bootstrap` | | Comma-separated `ip:port` list of peers to join through |
